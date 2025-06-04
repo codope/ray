@@ -3199,10 +3199,33 @@ void CoreWorker::RunTaskExecutionLoop() {
                  nullptr);
           }
           if (status.IsUnexpectedSystemExit()) {
-            Exit(
-                rpc::WorkerExitType::SYSTEM_ERROR,
-                absl::StrCat("Worker exits unexpectedly by a signal. ", status.message()),
-                nullptr);
+            // Check if this is SIGTERM, which should trigger graceful shutdown
+            // instead of immediate termination for concurrent actors
+            std::string message = status.message();
+            bool is_sigterm = message.find("SIGTERM") != std::string::npos;
+            bool is_concurrent_actor = false;
+            
+            // Check if this is a concurrent actor (max_concurrency > 1)
+            {
+              absl::MutexLock lock(&mutex_);
+              is_concurrent_actor = !actor_id_.IsNil() && 
+                                  worker_context_.CurrentActorMaxConcurrency() > 1;
+            }
+            
+            if (is_sigterm && is_concurrent_actor) {
+              // For SIGTERM on concurrent actors, trigger graceful shutdown
+              // instead of immediate termination
+              RAY_LOG(INFO) << "SIGTERM received on concurrent actor, initiating graceful shutdown";
+              Exit(rpc::WorkerExitType::INTENDED_USER_EXIT,
+                   absl::StrCat("Graceful shutdown due to SIGTERM. ", status.message()),
+                   nullptr);
+            } else {
+              // For other signals or non-concurrent actors, use immediate termination
+              Exit(
+                  rpc::WorkerExitType::SYSTEM_ERROR,
+                  absl::StrCat("Worker exits unexpectedly by a signal. ", status.message()),
+                  nullptr);
+            }
           }
         },
         10,
