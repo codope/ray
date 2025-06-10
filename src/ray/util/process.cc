@@ -519,6 +519,31 @@ int Process::Wait() const {
         // Just the normal waitpid() case.
         // (We can only do this once, only if we own the process. It fails otherwise.)
         error = std::error_code(errno, std::system_category());
+        
+        // Check if the child was already reaped by the subreaper
+        if (error.value() == ECHILD) {
+#ifdef __linux__
+          // Try to get the exit code from the subreaper's KnownChildrenTracker
+          auto exit_code_opt = KnownChildrenTracker::instance().GetChildExitCode(pid);
+          if (exit_code_opt.has_value()) {
+            status = exit_code_opt.value();
+            error = std::error_code();  // Clear the error since we found the exit code
+          }
+#endif
+        }
+      } else {
+        // Properly interpret the status returned by waitpid()
+        if (WIFEXITED(status)) {
+          // Process exited normally - return the exit code
+          status = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+          // Process was killed by a signal - return non-zero to indicate abnormal termination
+          // Use 128 + signal number convention (similar to shell behavior)
+          status = 128 + WTERMSIG(status);
+        } else {
+          // Process stopped or continued (shouldn't happen with our usage)
+          status = -1;
+        }
       }
 #endif
       if (error) {

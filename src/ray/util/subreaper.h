@@ -19,6 +19,8 @@
 #include <sys/types.h>
 
 #include <boost/asio.hpp>
+#include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
@@ -92,9 +94,15 @@ class KnownChildrenTracker {
   void AddKnownChild(std::function<pid_t()> create_child_fn);
 
   // If the child is not owned, this is a no-op.
-  // If enabled_, removes the child pid from the known `children_`.
+  // If enabled_, removes the child pid from the known `children_` and stores its exit code.
   // If !enabled_, does nothing.
-  void RemoveKnownChild(pid_t pid);
+  void RemoveKnownChild(pid_t pid, int exit_code = -1);
+
+  // Get the stored exit code for a child process that was reaped by the subreaper.
+  // Returns the exit code if available, or std::nullopt if not found.
+  // This allows AgentManager to get the actual exit code even when the child was
+  // reaped by the subreaper's SIGCHLD handler.
+  std::optional<int> GetChildExitCode(pid_t pid);
 
   // Caller may list all processes within `list_all_fn`.
   // Returns the subset of fn-returned pids that are NOT in the known `children_`.
@@ -113,6 +121,7 @@ class KnownChildrenTracker {
   bool enabled_ = false;
   absl::Mutex m_;
   absl::flat_hash_set<pid_t> children_ ABSL_GUARDED_BY(m_);
+  std::unordered_map<pid_t, int> child_exit_codes_ ABSL_GUARDED_BY(m_);
 };
 
 #endif

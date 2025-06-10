@@ -102,10 +102,21 @@ void AgentManager::StartAgent() {
       node_death_info.set_reason(rpc::NodeDeathInfo::UNEXPECTED_TERMINATION);
       node_death_info.set_reason_message(options_.agent_name +
                                          " failed and raylet fate-shares with it.");
-      shutdown_raylet_gracefully_(node_death_info);
-      // If the process is not terminated within 10 seconds, forcefully kill raylet
-      // itself.
-      delay_executor_([]() { QuickExit(); }, /*ms*/ 10000);
+      
+      // Check if the agent was killed by a signal (non-zero exit code indicates abnormal termination)
+      if (exit_code != 0) {
+        RAY_LOG(ERROR) << "Agent " << options_.agent_name 
+                       << " was killed abnormally (exit code: " << exit_code 
+                       << "), forcing immediate raylet exit.";
+        // For abnormal termination (like SIGKILL), exit immediately with non-zero code
+        std::_Exit(exit_code);
+      } else {
+        // For normal exit code but unexpected termination, shut down gracefully
+        shutdown_raylet_gracefully_(node_death_info);
+        // If the process is not terminated within 10 seconds, forcefully kill raylet
+        // itself.
+        delay_executor_([]() { QuickExit(); }, /*ms*/ 10000);
+      }
     }
   });
 }
