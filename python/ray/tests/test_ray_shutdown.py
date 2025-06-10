@@ -287,19 +287,16 @@ def test_raylet_graceful_exit_upon_agent_exit(ray_start_cluster):
     raylet, agent = get_raylet_agent_procs(worker)
     agent.terminate()
     exit_code = raylet.wait()
-    # When the agent is terminated
+    # When the agent is terminated gracefully
     assert exit_code == 0
 
-    # Make sure raylet exits gracefully upon agent terminated by SIGKILL.
-    # TODO(sang): Make raylet exits ungracefully in this case. It is currently
-    # not possible because we cannot detect the exit code of children process
-    # from cpp code.
+    # Make sure raylet exits ungracefully upon agent terminated by SIGKILL.
     worker = cluster.add_node(num_cpus=0)
     raylet, agent = get_raylet_agent_procs(worker)
     agent.kill()
     exit_code = raylet.wait()
-    # When the agent is terminated
-    assert exit_code == 0
+    # When the agent is killed abruptly, raylet should exit ungracefully
+    assert exit_code != 0  # Should be 137 (128 + 9) for SIGKILL
 
 
 def test_raylet_graceful_exit_upon_runtime_env_agent_exit(ray_start_cluster):
@@ -337,8 +334,8 @@ def test_raylet_graceful_exit_upon_runtime_env_agent_exit(ray_start_cluster):
     raylet, agent = get_raylet_runtime_env_agent_procs(worker)
     agent.kill()
     exit_code = raylet.wait()
-    # When the agent is terminated
-    assert exit_code == 0
+    # When the agent is killed abruptly, raylet should exit ungracefully
+    assert exit_code != 0
 
 
 @pytest.mark.skipif(platform.system() == "Windows", reason="Hang on Windows.")

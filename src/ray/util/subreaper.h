@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/synchronization/mutex.h"
 #include "ray/util/macros.h"
 #endif
@@ -96,6 +97,9 @@ class KnownChildrenTracker {
   // If !enabled_, does nothing.
   void RemoveKnownChild(pid_t pid);
 
+  void SetChildExitCode(pid_t pid, int exit_code);
+  std::optional<int> GetChildExitCode(pid_t pid);
+
   // Caller may list all processes within `list_all_fn`.
   // Returns the subset of fn-returned pids that are NOT in the known `children_`.
   // Thread safe.
@@ -113,6 +117,7 @@ class KnownChildrenTracker {
   bool enabled_ = false;
   absl::Mutex m_;
   absl::flat_hash_set<pid_t> children_ ABSL_GUARDED_BY(m_);
+  absl::flat_hash_map<pid_t, int> child_exit_codes_ ABSL_GUARDED_BY(m_);
 };
 
 #endif

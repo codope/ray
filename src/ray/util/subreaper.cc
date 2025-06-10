@@ -67,13 +67,19 @@ void SigchldHandlerReapZombieAndRemoveKnownChildren(
   // Reaps any children that have exited. WNOHANG makes waitpid non-blocking and returns
   // 0 if there's no zombie children.
   while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+    int exit_code = 0;
     if (WIFEXITED(status)) {
-      RAY_LOG(INFO) << "Child process " << pid << " exited with status "
-                    << WEXITSTATUS(status);
+      exit_code = WEXITSTATUS(status);
+      RAY_LOG(INFO) << "Child process " << pid << " exited with status " << exit_code;
     } else if (WIFSIGNALED(status)) {
-      RAY_LOG(INFO) << "Child process " << pid << " exited from signal "
-                    << WTERMSIG(status);
+      int signal_num = WTERMSIG(status);
+      exit_code = 128 + signal_num;  // Follow shell convention
+      RAY_LOG(INFO) << "Child process " << pid << " exited from signal " << signal_num
+                    << " (exit_code=" << exit_code << ")";
     }
+
+    // Store the exit code for the process so AgentManager can retrieve it
+    KnownChildrenTracker::instance().SetChildExitCode(pid, exit_code);
     KnownChildrenTracker::instance().RemoveKnownChild(pid);
   }
 }
@@ -143,6 +149,28 @@ void KnownChildrenTracker::RemoveKnownChild(pid_t pid) {
   }
   absl::MutexLock lock(&m_);
   children_.erase(pid);
+}
+
+void KnownChildrenTracker::SetChildExitCode(pid_t pid, int exit_code) {
+  if (!enabled_) {
+    return;
+  }
+  absl::MutexLock lock(&m_);
+  child_exit_codes_[pid] = exit_code;
+}
+
+std::optional<int> KnownChildrenTracker::GetChildExitCode(pid_t pid) {
+  if (!enabled_) {
+    return std::nullopt;
+  }
+  absl::MutexLock lock(&m_);
+  auto it = child_exit_codes_.find(pid);
+  if (it != child_exit_codes_.end()) {
+    int exit_code = it->second;
+    child_exit_codes_.erase(it);  // Remove after retrieving
+    return exit_code;
+  }
+  return std::nullopt;
 }
 
 std::vector<pid_t> KnownChildrenTracker::ListUnknownChildren(

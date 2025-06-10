@@ -497,6 +497,15 @@ int Process::Wait() const {
         status = -1;
       }
 #else
+      // First check if the subreaper already reaped this process and stored its exit code
+#ifdef __linux__
+      auto subreaper_exit_code = KnownChildrenTracker::instance().GetChildExitCode(pid);
+      if (subreaper_exit_code.has_value()) {
+        RAY_LOG(INFO) << "Retrieved exit code from subreaper for process " << pid
+                      << ": " << subreaper_exit_code.value();
+        return subreaper_exit_code.value();
+      }
+#endif
       // There are 3 possible cases:
       // - The process is a child whose death we await via waitpid().
       //   This is the usual case, when we have a child whose SIGCHLD we handle.
@@ -514,11 +523,35 @@ int Process::Wait() const {
         while ((r = read(fd, buf, sizeof(buf))) > 0) {
           // Keep reading until socket terminates
         }
+
+        // After pipe closes, check again if subreaper stored the exit code
+#ifdef __linux__
+        auto delayed_exit_code = KnownChildrenTracker::instance().GetChildExitCode(pid);
+        if (delayed_exit_code.has_value()) {
+          RAY_LOG(INFO) << "Retrieved delayed exit code from subreaper for process " << pid
+                        << ": " << delayed_exit_code.value();
+          return delayed_exit_code.value();
+        }
+#endif
+
         status = r == -1 ? -1 : 0;
       } else if (waitpid(pid, &status, 0) == -1) {
         // Just the normal waitpid() case.
         // (We can only do this once, only if we own the process. It fails otherwise.)
         error = std::error_code(errno, std::system_category());
+      } else {
+        // Properly interpret the status returned by waitpid()
+        if (WIFEXITED(status)) {
+          // Process exited normally - return the exit code
+          status = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+          // Process was killed by a signal - return non-zero to indicate abnormal termination
+          // Use 128 + signal number convention (similar to shell behavior)
+          status = 128 + WTERMSIG(status);
+        } else {
+          // Process stopped or continued (shouldn't happen with our usage)
+          status = -1;
+        }
       }
 #endif
       if (error) {
