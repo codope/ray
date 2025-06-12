@@ -945,6 +945,8 @@ void NodeManager::NodeRemoved(const NodeID &node_id) {
   RAY_LOG(DEBUG).WithField(node_id) << "[NodeRemoved] Received callback from node id ";
 
   if (node_id == self_node_id_) {
+    RAY_LOG(ERROR) << "NodeRemoved callback received for self node. " << "Is this raylet "
+                      << "drained? " << is_shutdown_request_received_;
     if (!is_shutdown_request_received_) {
       std::ostringstream error_message;
       error_message
@@ -3249,7 +3251,10 @@ std::unique_ptr<AgentManager> NodeManager::CreateDashboardAgentManager(
       [this](std::function<void()> task, uint32_t delay_ms) {
         return execute_after(io_service_, task, std::chrono::milliseconds(delay_ms));
       },
-      shutdown_raylet_gracefully_);
+      [this](const rpc::NodeDeathInfo &death_info) {
+        is_shutdown_request_received_ = true;
+        shutdown_raylet_gracefully_(death_info);
+      });
 }
 
 std::unique_ptr<AgentManager> NodeManager::CreateRuntimeEnvAgentManager(
@@ -3281,7 +3286,10 @@ std::unique_ptr<AgentManager> NodeManager::CreateRuntimeEnvAgentManager(
       [this](std::function<void()> task, uint32_t delay_ms) {
         return execute_after(io_service_, task, std::chrono::milliseconds(delay_ms));
       },
-      shutdown_raylet_gracefully_);
+      [this](const rpc::NodeDeathInfo &death_info) {
+        is_shutdown_request_received_ = true;
+        shutdown_raylet_gracefully_(death_info);
+      });
 }
 
 }  // namespace ray::raylet

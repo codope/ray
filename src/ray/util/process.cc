@@ -515,6 +515,9 @@ int Process::Wait() const {
           // Keep reading until socket terminates
         }
         status = r == -1 ? -1 : 0;
+        RAY_LOG(ERROR) << "Process " << pid
+                     << " exited with status " << status
+                     << " (read from pipe, r = " << r << ")";
       } else {
         if (waitpid(pid, &status, 0) == -1) {
           error = std::error_code(errno, std::system_category());
@@ -551,10 +554,13 @@ int Process::Wait() const {
     } else {
       // (Dummy process case)
       status = 0;
+      RAY_LOG(DEBUG) << "Process is a dummy process with PID " << pid
+                     << ", returning status " << status;
     }
   } else {
     // (Null process case)
     status = -1;
+    RAY_LOG(ERROR) << "Process is null, cannot wait for it.";
   }
   return status;
 }

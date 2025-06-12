@@ -110,12 +110,12 @@ void AgentManager::StartAgent() {
       } else {
         // Agent exited with a non-zero code, indicating a hard failure.
         // The raylet should also exit ungracefully and immediately.
-        RAY_LOG(ERROR)
+        RAY_LOG(FATAL)
             << "The raylet is exiting immediately because agent '" << options_.agent_name
             << "' exited unexpectedly with exit code " << exit_code
             << ". This may be caused by an OOM error, a bug in the agent code, or "
                "other system resource constraints. Check the agent logs for details.";
-        QuickExit();
+        // QuickExit();
       }
     }
   });
