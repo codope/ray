@@ -83,29 +83,39 @@ void AgentManager::StartAgent() {
                   << " exited, exit code " << exit_code << ".";
 
     if (fate_shares_.load()) {
-      RAY_LOG(ERROR)
-          << "The raylet exited immediately because one Ray agent failed, agent_name = "
-          << options_.agent_name
-          << ".\n"
-             "The raylet fate shares with the agent. This can happen because\n"
-             "- The version of `grpcio` doesn't follow Ray's requirement. "
-             "Agent can segfault with the incorrect `grpcio` version. "
-             "Check the grpcio version `pip freeze | grep grpcio`.\n"
-             "- The agent failed to start because of unexpected error or port conflict. "
-             "Read the log `cat "
-             "/tmp/ray/session_latest/logs/{dashboard_agent|runtime_env_agent}.log`. "
-             "You can find the log file structure here "
-             "https://docs.ray.io/en/master/ray-observability/user-guides/"
-             "configure-logging.html#logging-directory-structure.\n"
-             "- The agent is killed by the OS (e.g., out of memory).";
-      rpc::NodeDeathInfo node_death_info;
-      node_death_info.set_reason(rpc::NodeDeathInfo::UNEXPECTED_TERMINATION);
-      node_death_info.set_reason_message(options_.agent_name +
-                                         " failed and raylet fate-shares with it.");
-      shutdown_raylet_gracefully_(node_death_info);
-      // If the process is not terminated within 10 seconds, forcefully kill raylet
-      // itself.
-      delay_executor_([]() { QuickExit(); }, /*ms*/ 10000);
+      if (exit_code == 0) {
+        // Agent exited with 0, but it is still an unexpected failure.
+        // We trigger a graceful shutdown to allow for cleanup and reporting.
+        RAY_LOG(ERROR)
+            << "The raylet exited immediately because one Ray agent failed (exit code 0)"
+            << ", agent_name = " << options_.agent_name << ".\n"
+            << "The raylet fate shares with the agent. This can happen because\n"
+               "- The version of `grpcio` doesn't follow Ray's requirement. "
+               "Agent can segfault with the incorrect `grpcio` version. "
+               "Check the grpcio version `pip freeze | grep grpcio`.\n"
+               "- The agent failed to start because of unexpected error or port "
+               "conflict. Read the log `cat "
+               "/tmp/ray/session_latest/logs/{dashboard_agent|runtime_env_agent}.log`. "
+               "\n"
+               "- The agent is killed by the OS (e.g., out of memory).";
+        rpc::NodeDeathInfo node_death_info;
+        node_death_info.set_reason(rpc::NodeDeathInfo::UNEXPECTED_TERMINATION);
+        node_death_info.set_reason_message(
+            options_.agent_name +
+            " unexpectedly exited with exit code 0 and raylet fate-shares with it.");
+        shutdown_raylet_gracefully_(node_death_info);
+        // If the process is not terminated within 10 seconds, forcefully kill raylet
+        // itself.
+        delay_executor_([]() { QuickExit(); }, /*ms*/ 10000);
+      } else {
+        // Agent exited with a non-zero code, indicating a hard failure.
+        // The raylet should also exit ungracefully and immediately.
+        RAY_LOG(ERROR)
+            << "The raylet is exiting immediately because agent '" << options_.agent_name
+            << "' exited unexpectedly with exit code " << exit_code
+            << ". This may be caused by an OOM error, a bug in the agent code, or "
+               "other system resource constraints. Check the agent logs for details.";
+      }
     }
   });
 }

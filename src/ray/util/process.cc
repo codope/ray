@@ -515,10 +515,34 @@ int Process::Wait() const {
           // Keep reading until socket terminates
         }
         status = r == -1 ? -1 : 0;
-      } else if (waitpid(pid, &status, 0) == -1) {
-        // Just the normal waitpid() case.
-        // (We can only do this once, only if we own the process. It fails otherwise.)
-        error = std::error_code(errno, std::system_category());
+      } else {
+        if (waitpid(pid, &status, 0) == -1) {
+          error = std::error_code(errno, std::system_category());
+          if (error.value() == ECHILD) {
+            // The process is not a child of the current process, which probably means
+            // it has been reaped by the real parent. This can happen when the
+            // child process dies and the subreaper process reaps it before raylet.
+            // In this case, we don't know the exit code, so we just set it to 1
+            // to indicate that the process has exited ungracefully.
+            // Clear the error code because we don't want to log it as an error.
+            error.clear();
+            status = 1;
+            RAY_LOG(ERROR) << "Process " << pid << " is not a child of the current process, "
+                           << "which probably means it has been reaped by the real parent. "
+                           << "This can happen when the child process dies and the subreaper "
+                           << "process reaps it before raylet. In this case, we don't know the "
+                           << "exit code, so we just set it to 1 to indicate that the process "
+                           << "has exited ungracefully.";
+          }
+        } else {
+          if (WIFEXITED(status)) {
+            status = WEXITSTATUS(status);
+            RAY_LOG(INFO) << "Process " << pid << " exited with status " << status;
+          } else if (WIFSIGNALED(status)) {
+            status = 128 + WTERMSIG(status);
+            RAY_LOG(INFO) << "Process " << pid << " exited with signal " << status;
+          }
+        }
       }
 #endif
       if (error) {

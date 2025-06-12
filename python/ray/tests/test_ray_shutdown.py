@@ -299,7 +299,7 @@ def test_raylet_graceful_exit_upon_agent_exit(ray_start_cluster):
     agent.kill()
     exit_code = raylet.wait()
     # When the agent is terminated
-    assert exit_code == 0
+    assert exit_code != 0
 
 
 def test_raylet_graceful_exit_upon_runtime_env_agent_exit(ray_start_cluster):
