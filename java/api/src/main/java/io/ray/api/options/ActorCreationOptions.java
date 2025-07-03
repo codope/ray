@@ -5,6 +5,7 @@ import io.ray.api.concurrencygroup.ConcurrencyGroup;
 import io.ray.api.placementgroup.PlacementGroup;
 import io.ray.api.runtimeenv.RuntimeEnv;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -15,7 +16,7 @@ public class ActorCreationOptions extends BaseTaskOptions {
   public static final int INFINITE_RESTART = -1;
 
   public final String name;
-  public ActorLifetime lifetime;
+  public final ActorLifetime lifetime;
   public final int maxRestarts;
   public final int maxTaskRetries;
   public final List<String> jvmOptions;
@@ -49,11 +50,17 @@ public class ActorCreationOptions extends BaseTaskOptions {
     this.lifetime = lifetime;
     this.maxRestarts = maxRestarts;
     this.maxTaskRetries = maxTaskRetries;
-    this.jvmOptions = jvmOptions;
+    this.jvmOptions =
+        jvmOptions == null
+            ? Collections.emptyList()
+            : Collections.unmodifiableList(new ArrayList<>(jvmOptions));
     this.maxConcurrency = maxConcurrency;
     this.group = group;
     this.bundleIndex = bundleIndex;
-    this.concurrencyGroups = concurrencyGroups;
+    this.concurrencyGroups =
+        concurrencyGroups == null
+            ? Collections.emptyList()
+            : Collections.unmodifiableList(new ArrayList<>(concurrencyGroups));
     this.serializedRuntimeEnv = serializedRuntimeEnv;
     this.namespace = namespace;
     this.maxPendingCalls = maxPendingCalls;
@@ -159,7 +166,8 @@ public class ActorCreationOptions extends BaseTaskOptions {
      * @return self
      */
     public Builder setJvmOptions(List<String> jvmOptions) {
-      this.jvmOptions = jvmOptions;
+      // Store a defensive mutable copy. Immutable wrapping happens in build().
+      this.jvmOptions = jvmOptions == null ? new ArrayList<>() : new ArrayList<>(jvmOptions);
       return this;
     }
 
@@ -243,7 +251,8 @@ public class ActorCreationOptions extends BaseTaskOptions {
 
     /** Set the concurrency groups for this actor. */
     public Builder setConcurrencyGroups(List<ConcurrencyGroup> concurrencyGroups) {
-      this.concurrencyGroups = concurrencyGroups;
+      this.concurrencyGroups =
+          concurrencyGroups == null ? new ArrayList<>() : new ArrayList<>(concurrencyGroups);
       return this;
     }
 

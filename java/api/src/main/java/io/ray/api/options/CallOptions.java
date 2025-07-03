@@ -25,7 +25,7 @@ public class CallOptions extends BaseTaskOptions {
     this.name = name;
     this.group = group;
     this.bundleIndex = bundleIndex;
-    this.concurrencyGroupName = concurrencyGroupName;
+    this.concurrencyGroupName = concurrencyGroupName == null ? "" : concurrencyGroupName;
     this.serializedRuntimeEnvInfo =
         runtimeEnv == null ? "" : runtimeEnv.serializeToRuntimeEnvInfo();
   }
@@ -102,5 +102,14 @@ public class CallOptions extends BaseTaskOptions {
     public CallOptions build() {
       return new CallOptions(name, resources, group, bundleIndex, concurrencyGroupName, runtimeEnv);
     }
+  }
+
+  /** Accessor for resources via BaseTaskOptions. */
+  public Map<String, Double> getResources() {
+    return super.getResources();
+  }
+
+  public String getSerializedRuntimeEnvInfo() {
+    return serializedRuntimeEnvInfo;
   }
 }

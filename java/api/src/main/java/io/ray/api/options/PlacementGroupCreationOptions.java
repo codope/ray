@@ -30,7 +30,12 @@ public class PlacementGroupCreationOptions {
           "`PlacementStrategy` must be specified when creating a new placement group.");
     }
     this.name = name;
-    this.bundles = bundles;
+    // Ensure immutability of bundle definitions.
+    java.util.List<java.util.Map<String, Double>> tmp = new java.util.ArrayList<>();
+    for (java.util.Map<String, Double> map : bundles) {
+      tmp.add(java.util.Collections.unmodifiableMap(new java.util.HashMap<>(map)));
+    }
+    this.bundles = java.util.Collections.unmodifiableList(tmp);
     this.strategy = strategy;
   }
 
