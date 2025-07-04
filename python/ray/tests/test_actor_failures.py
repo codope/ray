@@ -2,8 +2,10 @@ import atexit
 import asyncio
 import collections
 import os
+import pathlib
 import signal
 import sys
+import tempfile
 import time
 
 import pytest
@@ -1246,6 +1248,87 @@ def test_actor_restart_and_partial_task_not_completed(shutdown_only):
     os.kill(pid, signal.SIGKILL)
     ray.get(signal_actor_2.send.remote())
     assert ray.get(refs) == [3, 4, 5]
+
+
+# ---------------------------------------------------------------------
+# Utilities for the new actor-cleanup tests
+# ---------------------------------------------------------------------
+
+# Helper run inside an actor or from __del__/atexit to prove the cleanup ran.
+def _touch_path(path_str: str):
+    pathlib.Path(path_str).write_text("CLEAN\n")
+
+# =========================================================================
+#  Reproduce community issues 50004 & 53169 (expected to FAIL today)
+# =========================================================================
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Signal semantics differ on Windows")
+def test_actor_sigterm_does_not_run_atexit(ray_start_regular, tmp_path):
+    """
+    Issue #50004 reproduction.
+
+    We register an atexit handler inside the actor that touches a file.
+    Ray’s current quick-exit path should *prevent* that handler from running,
+    therefore the final assertion **fails** (red bar ⇒ ready for TDD).
+    """
+    temp_file = tmp_path / "sigterm_atexit.log"
+    assert not temp_file.exists()
+
+    @ray.remote
+    class A:
+        def __init__(self, p: str):
+            atexit.register(_touch_path, p)
+
+        def pid(self):
+            return os.getpid()
+
+    actor = A.remote(str(temp_file))
+    worker_pid = ray.get(actor.pid.remote())
+
+    # Send SIGTERM directly to the worker process.
+    os.kill(worker_pid, signal.SIGTERM)
+    wait_for_pid_to_exit(worker_pid)
+
+    # Fails today: file was never created because atexit didn't run.
+    assert temp_file.exists()
+
+
+def test_actor_kill_does_not_run_del(ray_start_regular, tmp_path):
+    """
+    Issue #53169 reproduction.
+
+    When the actor process is killed via `ray.kill`, `__del__`
+    should touch a file.  Current behaviour skips __del__, so the
+    assertion fails.
+    """
+    temp_file = tmp_path / "killactor_del.log"
+    assert not temp_file.exists()
+
+    @ray.remote
+    class B:
+        def __init__(self, p: str):
+            self._p = p
+
+        def __del__(self):
+            _touch_path(self._p)
+
+    actor = B.remote(str(temp_file))
+
+    ray.kill(actor, no_restart=True)
+
+    # Wait a little; if cleanup ran, file would appear quickly.
+    def _file_exists():
+        return temp_file.exists()
+
+    try:
+        wait_for_condition(_file_exists, timeout=10)
+    except RuntimeError:
+        # Expected with current behaviour – the file never appears.
+        pass
+
+    # Final assertion – red today, should turn green after the fix.
+    assert temp_file.exists()
 
 
 if __name__ == "__main__":
