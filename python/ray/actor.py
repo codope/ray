@@ -2302,8 +2302,39 @@ def _modify_class(cls):
             return fn(self, *args, **kwargs)
 
         def __ray_terminate__(self):
+            # NOTE: When users call `actor.__ray_terminate__.remote()`, we
+            # expect Python-level cleanup logic (``__del__`` as well as any
+            # ``atexit`` handlers registered inside the actor) to run.
+            #
+            # Today, Ray exits the worker process via a quick-exit path in C++
+            # that bypasses Python GC, so an actor's ``__del__`` method is
+            # never triggered.  We rectify this by explicitly invoking the
+            # destructor here before proceeding with the normal exit logic.
             worker = ray._private.worker.global_worker
+
             if worker.mode != ray.LOCAL_MODE:
+                # Best-effort attempt to run user defined destructor once.  We
+                # guard with ``hasattr`` to avoid AttributeError on classes
+                # that don't define ``__del__``.  Any exception raised from
+                # user code must not prevent the actor from exiting, so we
+                # swallow it and log for visibility.
+                try:
+                    dunder_del = getattr(self, "__del__", None)
+                    if dunder_del is not None:
+                        dunder_del()
+                except Exception:  # noqa: BLE001 – destructor must not crash actor
+                    import logging, traceback
+
+                    logging.getLogger("ray.actor").warning(
+                        "Exception raised inside __del__ while handling "
+                        "__ray_terminate__:\n%s",
+                        traceback.format_exc(),
+                    )
+
+                # Proceed with the standard graceful-exit path.  This raises
+                # SystemExit underneath, giving atexit handlers a chance to
+                # run.  Quick-exit will still eventually be invoked from the
+                # C++ side, but only *after* Python-level cleanup above.
                 ray.actor.exit_actor()
 
     Class.__module__ = cls.__module__

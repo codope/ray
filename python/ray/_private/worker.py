@@ -965,10 +965,19 @@ class Worker:
         """The main loop a worker runs to receive and execute tasks."""
 
         def sigterm_handler(signum, frame):
-            raise_sys_exit_with_custom_error_message(
-                "The process receives a SIGTERM.", exit_code=1
-            )
-            # Note: shutdown() function is called from atexit handler.
+            # Gracefully shut down the worker so Python-level cleanup code
+            # (atexit handlers, actor __del__, etc.) has a chance to run.
+            try:
+                # Report a user-initiated exit reason to GCS.
+                self.core_worker.drain_and_exit_worker("user", "Received SIGTERM")
+                # `drain_and_exit_worker` never returns, but invoke sys.exit
+                # defensively in case the above is a no-op (e.g. unit test stub).
+            except Exception:  # noqa: BLE001
+                raise_sys_exit_with_custom_error_message(
+                    "The process received SIGTERM and failed to exit "
+                    "gracefully; falling back to quick exit.",
+                    exit_code=1,
+                )
 
         ray._private.utils.set_sigterm_handler(sigterm_handler)
         self.core_worker.run_task_loop()
