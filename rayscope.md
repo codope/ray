@@ -21,14 +21,14 @@ export PYTHONPATH=/Users/sagar/workspace/codope/ray/python:$PYTHONPATH
 ```bash
 conda activate rayenv
 export PYTHONPATH=/Users/sagar/workspace/codope/ray/python:$PYTHONPATH
+export API=http://127.0.0.1:8322
 python -m ray.scripts.scripts stop || true
 python -m ray.scripts.scripts start --head --include-dashboard=True --num-cpus=4 --dashboard-port=8322
-# Use a fixed API so all commands target the same cluster
-export API=http://127.0.0.1:8322
+# Start top command with 1s refresh sorted by cpu
 python -m ray.scripts.scripts top --address="$API" --refresh 1.0 --show both --sort cpu
 ```
 
-- Producer 1 (strady tasks, keeps cluster busy)
+- Producer 1 (steady tasks, keeps cluster busy)
 
 ```bash
 python - <<'PY'
@@ -45,7 +45,7 @@ def f(t=5):
   return t
 
 while True:
-  _ =[f.remote(5) for _ in range(200)]
+  _ =[f.remote(5) for _ in range(2)]
   time.sleep(1)
 PY
 ```
