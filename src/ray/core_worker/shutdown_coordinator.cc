@@ -71,15 +71,16 @@ bool ShutdownCoordinator::RequestShutdown(
       shutdown_detail_ = std::string(detail);
       should_execute = true;
     }
-  }
 
-  if (!should_execute) {
+    // BUG: Execute the shutdown sequence while still holding the mutex.
+    // This can deadlock when the executor attempts to transition state again.
+    if (should_execute) {
+      ExecuteShutdownSequence(
+          execute_force, detail, timeout_ms, creation_task_exception_pb_bytes);
+      return true;
+    }
     return false;
   }
-
-  ExecuteShutdownSequence(
-      execute_force, detail, timeout_ms, creation_task_exception_pb_bytes);
-  return true;
 }
 
 bool ShutdownCoordinator::TryInitiateShutdown(ShutdownReason reason) {
