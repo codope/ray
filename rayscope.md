@@ -14,16 +14,119 @@ conda activate rayenv
 export PYTHONPATH=/Users/sagar/workspace/codope/ray/python:$PYTHONPATH
 ```
 
-### Start a local cluster (and capture the API server address)
+### Start a local cluster (fixed port, set API)
 
 - Option A: via CLI (dashboard can auto-pick a free port with `--dashboard-port=0`)
 
 ```bash
-python -m ray.scripts.scripts start --head --include-dashboard=True --num-cpus=4 --dashboard-port=0
-# The output prints an API address like:
-#   RAY_API_SERVER_ADDRESS='http://127.0.0.1:63241'
-# Export it so all commands use the same cluster:
-export API=http://127.0.0.1:63241   # <-- replace with the value printed above
+conda activate rayenv
+export PYTHONPATH=/Users/sagar/workspace/codope/ray/python:$PYTHONPATH
+python -m ray.scripts.scripts stop || true
+python -m ray.scripts.scripts start --head --include-dashboard=True --num-cpus=4 --dashboard-port=8322
+# Use a fixed API so all commands target the same cluster
+export API=http://127.0.0.1:8322
+python -m ray.scripts.scripts top --address="$API" --refresh 1.0 --show both --sort cpu
+```
+
+- Producer 1 (strady tasks, keeps cluster busy)
+
+```bash
+python - <<'PY'
+import time, os, ray
+addr=os.environ.get("API","auto")
+try: 
+  ray.init(address=addr)
+except: 
+  ray.init()
+
+@ray.remote
+def f(t=5):
+  time.sleep(t)
+  return t
+
+while True:
+  _ =[f.remote(5) for _ in range(200)]
+  time.sleep(1)
+PY
+```
+
+- Producer 2 (bursty actors)
+
+```bash
+python - <<'PY'
+import time, os, ray
+
+addr=os.environ.get("API","auto")
+try: 
+  ray.init(address=addr)
+except: 
+  ray.init()
+
+@ray.remote
+class C:
+  def __init__(self):
+    self.n=0
+
+  def spin(self, t=2, k=10):
+    for _ in range(k):
+      self.n+=1
+      time.sleep(t/k)
+    return self.n
+
+actors=[C.remote() for _ in range(4)]
+while True:
+  _ = [a.spin.remote(3, 30) for a in actors]
+  time.sleep(1)
+PY
+```
+
+- Create pending tasks (simulate backlog)
+
+```bash
+python - <<'PY'
+import time, os, ray
+addr=os.environ.get("API","auto")
+try:
+  ray.init(address=addr)
+except:
+  ray.init()
+@ray.remote
+def g(x):
+  return x*x
+while True:
+  _=[g.remote(i) for i in range(5000)]
+  time.sleep(5)
+PY
+```
+
+- Flip actor state to DEAD/RESTARTING (crash/restart demo)
+
+```bash
+python - <<'PY'
+import os, time, ray
+addr=os.environ.get("API","auto")
+try:
+  ray.init(address=addr)
+except:
+  ray.init()
+@ray.remote(max_restarts=1, max_task_retries=0)
+class Flaky:
+  def __init__(self): self.n=0
+  def blow(self):
+    self.n+=1
+    raise RuntimeError("boom")
+  def ok(self):
+    self.n+=1
+    return self.n
+a=Flaky.remote()
+for _ in range(3):
+  try:
+    ray.get(a.blow.remote())
+  except Exception:
+    print("actor crashed as expected")
+  time.sleep(1)
+print("actor restarted; now ok()", ray.get(a.ok.remote()))
+PY
 ```
 
 - Option B: in-process (quick test)

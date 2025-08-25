@@ -350,17 +350,72 @@ def top(
             for n in node_dicts:
                 rows.append(
                     {
+                        "node_id": n.get("node_id"),
                         "node_ip": n.get("node_ip"),
                         "node_name": n.get("node_name"),
                         "is_head": bool(n.get("is_head_node")),
                         "state": str(n.get("state", "")),
                         "cpu": _res_total(n, "CPU"),
                         "gpu": _res_total(n, "GPU"),
+                        "workers": 0,
+                        "cpu_used": None,
+                        "gpu_used": None,
                     }
                 )
 
             if sort == "cpu":
                 rows.sort(key=lambda r: r["cpu"], reverse=True)
+
+            # Workers per node (best-effort)
+            try:
+                workers = client.list(
+                    StateResource.WORKERS,
+                    options=ListApiOptions(timeout=DEFAULT_RPC_TIMEOUT, limit=5000),
+                    raise_on_missing_output=False,
+                )
+                w_by_node = {}
+                for w in _to_dicts(workers):
+                    nid = w.get("node_id")
+                    if not nid:
+                        continue
+                    w_by_node[nid] = w_by_node.get(nid, 0) + 1
+                for r in rows:
+                    nid = r.get("node_id")
+                    if nid in w_by_node:
+                        r["workers"] = w_by_node[nid]
+            except Exception:
+                pass
+
+            # Used vs total (best-effort) via ray._private.state
+            try:
+                import ray
+                from ray._private import state as _pstate
+
+                # Try to connect if not already connected (best-effort)
+                if not ray.is_initialized():
+                    try:
+                        ray.init(address="auto", log_to_driver=False, ignore_reinit_error=True)
+                    except Exception:
+                        pass
+                totals = _pstate.total_resources_per_node()
+                avails = _pstate.available_resources_per_node()
+                for r in rows:
+                    nid = r.get("node_id")
+                    if not nid:
+                        continue
+                    t = totals.get(nid) or {}
+                    a = avails.get(nid) or {}
+                    try:
+                        cpu_t = float(t.get("CPU", 0))
+                        cpu_a = float(a.get("CPU", 0))
+                        r["cpu_used"] = max(0.0, cpu_t - cpu_a)
+                        gpu_t = float(t.get("GPU", 0))
+                        gpu_a = float(a.get("GPU", 0))
+                        r["gpu_used"] = max(0.0, gpu_t - gpu_a)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
 
             # Clear screen and print a compact summary.
             sys.stdout.write("\x1b[2J\x1b[H")
@@ -385,24 +440,39 @@ def top(
                 print(f"Objects (summary): nodes_reporting={total_objects}")
 
             # Per-node table
-            header = ["IP/NAME", "HEAD", "STATE", "CPU(total)", "GPU(total)"]
+            header = ["IP/NAME", "HEAD", "STATE", "CPU(used/total)", "GPU(used/total)", "WORKERS"]
             print(
                 " ".join(
                     [
                         header[0].ljust(18),
                         header[1].ljust(6),
                         header[2].ljust(8),
-                        header[3].rjust(12),
-                        header[4].rjust(12),
+                        header[3].rjust(18),
+                        header[4].rjust(18),
+                        header[5].rjust(8),
                     ]
                 )
             )
+            # Basic colors
+            GREEN = "\x1b[32m"; RED = "\x1b[31m"; YELLOW = "\x1b[33m"; RESET = "\x1b[0m"
             for r in rows:
                 name = r["node_ip"] or (r.get("node_name") or "-")
                 head = "Y" if r["is_head"] else "-"
-                state = r["state"]
+                st = (r["state"] or "").upper()
+                if st == "ALIVE":
+                    state_col = f"{GREEN}{st}{RESET}"
+                elif st == "DEAD":
+                    state_col = f"{RED}{st}{RESET}"
+                else:
+                    state_col = f"{YELLOW}{st}{RESET}"
+                cpu_disp = (
+                    f"{int(r['cpu_used'])}/{int(r['cpu'])}" if r["cpu_used"] is not None else f"-/{int(r['cpu'])}"
+                )
+                gpu_disp = (
+                    f"{int(r['gpu_used'])}/{int(r['gpu'])}" if r["gpu_used"] is not None else f"-/{int(r['gpu'])}"
+                )
                 print(
-                    f"{str(name)[:18].ljust(18)} {head.ljust(6)} {state.ljust(8)} {str(int(r['cpu'])):>12} {str(int(r['gpu'])):>12}"
+                    f"{str(name)[:18].ljust(18)} {head.ljust(6)} {state_col.ljust(8)} {cpu_disp:>18} {gpu_disp:>18} {str(r['workers']):>8}"
                 )
             _time.sleep(max(0.1, float(refresh)))
     except KeyboardInterrupt:
