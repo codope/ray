@@ -25,7 +25,9 @@
 #include "nlohmann/json.hpp"
 #include "ray/common/asio/instrumented_io_context.h"
 #include "ray/common/cgroup2/cgroup_manager.h"
+#ifdef __linux__
 #include "ray/common/cgroup2/sysfs_cgroup_driver.h"
+#endif
 #include "ray/common/constants.h"
 #include "ray/common/id.h"
 #include "ray/common/lease/lease.h"
@@ -258,6 +260,7 @@ int main(int argc, char *argv[]) {
 
   // TODO(#54703): Link OSS documentation once it's available in the error messages.
   if (enable_resource_isolation) {
+#ifdef __linux__
     RAY_CHECK(!cgroup_path.empty())
         << "Failed to start up raylet. If enable_resource_isolation is set to true, "
            "cgroup_path cannot be empty.";
@@ -268,7 +271,8 @@ int main(int argc, char *argv[]) {
         << "Failed to start up raylet. If enable_resource_isolation is set to true, "
            "system_reserved_memory_byres must be set to a value > 0";
 
-    std::unique_ptr<ray::SysFsCgroupDriver> cgroup_driver;
+    std::unique_ptr<ray::CgroupDriverInterface> cgroup_driver;
+    cgroup_driver = std::make_unique<ray::SysFsCgroupDriver>();
     ray::StatusOr<std::unique_ptr<ray::CgroupManager>> cgroup_manager =
         ray::CgroupManager::Create(std::move(cgroup_path),
                                    node_id,
@@ -280,8 +284,9 @@ int main(int argc, char *argv[]) {
     RAY_CHECK(cgroup_manager.ok())
         << "Failed to start raylet. Could not create CgroupManager because of "
         << cgroup_manager.ToString();
-
-#ifndef __linux__
+#else
+    (void)system_reserved_cpu_weight;
+    (void)system_reserved_memory_bytes;
     RAY_LOG(WARNING)
         << "Resource isolation with cgroups is only supported in linux. Please set "
            "enable_resource_isolation to false. This is likely a misconfiguration.";
