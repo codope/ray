@@ -63,3 +63,25 @@ ray_cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+ray_cc_test(
+    name = "fragmentation_benchmark",
+    srcs = ["fragmentation_benchmark.cc"],
+    size = "large",
+    tags = [
+        "manual",  # Only run manually due to performance impact
+        "benchmark",
+        "team:core",
+    ],
+    deps = [
+        "//src/ray/object_manager/plasma:plasma_allocator",
+        "@com_google_googletest//:gtest_main",
+    ] + select({
+        "//:jemalloc_linux": ["//src/ray/object_manager/plasma:jemalloc_allocator"],
+        "//conditions:default": [],
+    }),
+    defines = select({
+        "//:jemalloc_linux": ["JEMALLOC_AVAILABLE"],
+        "//conditions:default": [],
+    }),
+)

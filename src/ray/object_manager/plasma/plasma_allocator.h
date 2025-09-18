@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <sstream>
 #include <string>
 
 #include "absl/types/optional.h"
@@ -84,6 +85,27 @@ class PlasmaAllocator : public IAllocator {
   /// Get the number of bytes fallback allocated so far.
   int64_t FallbackAllocated() const override;
 
+  /// Get memory statistics for monitoring.
+  struct MemoryStats {
+    int64_t allocated_bytes;
+    int64_t footprint_limit;
+    int64_t fallback_allocated_bytes;
+    int64_t total_alloc_count;
+    int64_t total_free_count;
+    int64_t fallback_alloc_count;
+    int64_t active_allocations;
+    double fragmentation_estimate;
+  };
+
+  /// Get current memory statistics.
+  MemoryStats GetStats() const;
+
+  /// Record metrics to Ray's metrics system.
+  void RecordMetrics() const;
+
+  /// Get debug information for troubleshooting.
+  void GetDebugDump(std::stringstream &buffer) const;
+
  private:
   std::optional<Allocation> BuildAllocation(void *addr,
                                             size_t size,
@@ -96,6 +118,12 @@ class PlasmaAllocator : public IAllocator {
   // TODO(scv119): once we refactor object_manager this no longer
   // need to be atomic.
   std::atomic<int64_t> fallback_allocated_;
+
+  // Metrics tracking
+  mutable std::atomic<int64_t> total_alloc_count_{0};
+  mutable std::atomic<int64_t> total_free_count_{0};
+  mutable std::atomic<int64_t> fallback_alloc_count_{0};
+  mutable std::atomic<int64_t> active_allocations_{0};
 };
 
 }  // namespace plasma
