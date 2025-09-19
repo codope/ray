@@ -19,26 +19,17 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include "ray/common/ray_config.h"
+#include "ray/object_manager/plasma/common.h"
 #include "ray/object_manager/plasma/malloc.h"
 #include "ray/stats/metric_defs.h"
+#include "ray/util/compat.h"
 #include "ray/util/logging.h"
-
-// jemalloc functions
-extern "C" {
-void *je_mallocx(size_t size, int flags);
-void je_sdallocx(void *ptr, size_t size, int flags);
-int je_mallctl(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
-
-// jemalloc flags
-#define MALLOCX_ZERO ((int)0x40)
-#define MALLOCX_ARENA(a) ((int)(((a) + 1) << 8))
-#define MALLOCX_ALIGN(a) ((int)(((a) < 63 ? (a) : 63) << 0))
-}
 
 namespace plasma {
 
@@ -50,24 +41,23 @@ constexpr size_t kLargeObjectAlignment = 2 * 1024 * 1024;  // 2MB for huge pages
 // Minimum object size for Plasma (100KB)
 constexpr size_t kMinPlasmaObjectSize = 100 * 1024;
 
-// Gap between memory regions to prevent coalescing (same as dlmalloc)
-constexpr int64_t kMmapRegionsGap = sizeof(size_t);
+// Note: plasma::kMmapRegionsGap is defined in malloc.h
 
-// Track whether we've allocated once (for fallback logic)
-thread_local bool allocated_once = false;
+// Track whether we've allocated once (for fallback logic) - process-wide
+static bool allocated_once = false;
 
-// Give each mmap record a unique id to disambiguate fd reuse
-thread_local int64_t next_mmap_unique_id = INVALID_UNIQUE_FD_ID + 1;
+// Give each mmap record a unique id to disambiguate fd reuse - process-wide
+static int64_t next_mmap_unique_id = INVALID_UNIQUE_FD_ID + 1;
 
-// Track the initial allocation region
-thread_local void *initial_region_ptr = nullptr;
-thread_local size_t initial_region_size = 0;
+// Track the initial allocation region - process-wide
+static void *initial_region_ptr = nullptr;
+static size_t initial_region_size = 0;
 
-// Thread-local pointer to the allocator instance for extent hooks
-thread_local JemallocAllocator *g_allocator_instance = nullptr;
+// Process-wide pointer to the allocator instance for extent hooks
+static JemallocAllocator *g_allocator_instance = nullptr;
 
-// Thread-local flag to indicate we're in fallback allocation mode
-thread_local bool in_fallback_mode = false;
+// Process-wide flag to indicate we're in fallback allocation mode
+static std::atomic<bool> in_fallback_mode{false};
 
 // Helper functions
 void *pointer_advance(void *p, ptrdiff_t n) {
@@ -79,11 +69,13 @@ void *pointer_retreat(void *p, ptrdiff_t n) {
 }
 
 // Create and mmap a buffer, handling both primary and fallback allocation
-void create_and_mmap_buffer(int64_t size, void **pointer, int *fd,
-                           const std::string &plasma_directory,
-                           const std::string &fallback_directory,
-                           bool hugepages_enabled,
-                           bool fallback_enabled) {
+void create_and_mmap_buffer(int64_t size,
+                            void **pointer,
+                            int *fd,
+                            const std::string &plasma_directory,
+                            const std::string &fallback_directory,
+                            bool hugepages_enabled,
+                            bool fallback_enabled) {
   // Choose directory based on allocation mode
   std::string file_template = plasma_directory;
 
@@ -190,33 +182,35 @@ bool IsOutsideInitialAllocation(void *p) {
 }
 
 // Extent hook functions that will be registered with jemalloc
-void *PlasmaExtentAlloc(extent_hooks_t *extent_hooks, void *new_addr, size_t size,
-                        size_t alignment, bool *zero, bool *commit, unsigned arena_ind) {
+void *PlasmaExtentAlloc(extent_hooks_t *extent_hooks,
+                        void *new_addr,
+                        size_t size,
+                        size_t alignment,
+                        bool *zero,
+                        bool *commit,
+                        unsigned arena_ind) {
   if (!g_allocator_instance) {
     return nullptr;
   }
 
   // Add gap to prevent coalescing (same as dlmalloc)
-  size += kMmapRegionsGap;
+  size += plasma::kMmapRegionsGap;
 
   // Check if this is a fallback allocation
   bool is_fallback = in_fallback_mode &&
-                     g_allocator_instance->fallback_directory_ != "" &&
-                     allocated_once;
+                     g_allocator_instance->GetFallbackDirectory() != "" && allocated_once;
 
-  if (!is_fallback && allocated_once && g_allocator_instance->fallback_directory_ != "") {
-    // Refuse to overcommit in non-fallback mode after initial allocation
-    RAY_LOG(DEBUG) << "Refusing to overcommit in non-fallback mode: " << size;
-    return nullptr;
-  }
+  // Allow multiple extents in main arena; fragmentation is handled by jemalloc.
 
   void *pointer;
   int fd;
-  create_and_mmap_buffer(size, &pointer, &fd,
-                        g_allocator_instance->plasma_directory_,
-                        g_allocator_instance->fallback_directory_,
-                        g_allocator_instance->hugepage_enabled_,
-                        is_fallback);
+  create_and_mmap_buffer(size,
+                         &pointer,
+                         &fd,
+                         g_allocator_instance->GetPlasmaDirectory(),
+                         g_allocator_instance->GetFallbackDirectory(),
+                         g_allocator_instance->IsHugepageEnabled(),
+                         is_fallback);
 
   if (pointer == MAP_FAILED) {
     return nullptr;
@@ -225,21 +219,21 @@ void *PlasmaExtentAlloc(extent_hooks_t *extent_hooks, void *new_addr, size_t siz
   allocated_once = true;
 
   // Update metrics
-  g_allocator_instance->extent_alloc_count_++;
+  g_allocator_instance->IncrementExtentAllocCount();
   if (is_fallback) {
-    g_allocator_instance->fallback_alloc_count_++;
+    g_allocator_instance->IncrementFallbackAllocCount();
   }
 
   // Track the mapping
   {
-    absl::MutexLock lock(&g_allocator_instance->mutex_);
-    MmapRecord &record = g_allocator_instance->mmap_records_[pointer];
+    absl::MutexLock lock(&g_allocator_instance->GetMutex());
+    JemallocMmapRecord &record = g_allocator_instance->GetMmapRecords()[pointer];
     record.fd = MEMFD_TYPE(fd, next_mmap_unique_id++);
     record.size = size;
   }
 
   // Advance pointer by gap amount (lie to jemalloc about actual location)
-  void *adjusted_pointer = pointer_advance(pointer, kMmapRegionsGap);
+  void *adjusted_pointer = pointer_advance(pointer, plasma::kMmapRegionsGap);
 
   RAY_LOG(DEBUG) << "PlasmaExtentAlloc: allocated " << size << " bytes at "
                  << adjusted_pointer << " (actual: " << pointer << ")";
@@ -249,20 +243,24 @@ void *PlasmaExtentAlloc(extent_hooks_t *extent_hooks, void *new_addr, size_t siz
   return adjusted_pointer;
 }
 
-bool PlasmaExtentDalloc(extent_hooks_t *extent_hooks, void *addr, size_t size,
-                       bool committed, unsigned arena_ind) {
+bool PlasmaExtentDalloc(extent_hooks_t *extent_hooks,
+                        void *addr,
+                        size_t size,
+                        bool committed,
+                        unsigned arena_ind) {
   if (!g_allocator_instance) {
     return true;
   }
 
   // Retreat pointer to actual location
-  addr = pointer_retreat(addr, kMmapRegionsGap);
-  size += kMmapRegionsGap;
+  addr = pointer_retreat(addr, plasma::kMmapRegionsGap);
+  size += plasma::kMmapRegionsGap;
 
-  absl::MutexLock lock(&g_allocator_instance->mutex_);
-  auto it = g_allocator_instance->mmap_records_.find(addr);
+  absl::MutexLock lock(&g_allocator_instance->GetMutex());
+  auto it = g_allocator_instance->GetMmapRecords().find(addr);
 
-  if (it == g_allocator_instance->mmap_records_.end() || it->second.size != size) {
+  if (it == g_allocator_instance->GetMmapRecords().end() ||
+      it->second.size != static_cast<size_t>(size)) {
     // Reject requests that don't match previous allocations
     RAY_LOG(WARNING) << "PlasmaExtentDalloc: mismatch for " << addr << ", size " << size;
     return true;
@@ -271,12 +269,12 @@ bool PlasmaExtentDalloc(extent_hooks_t *extent_hooks, void *addr, size_t size,
   RAY_LOG(INFO) << "PlasmaExtentDalloc: freeing " << size << " bytes at " << addr;
 
   // Update metrics
-  g_allocator_instance->extent_dalloc_count_++;
+  g_allocator_instance->IncrementExtentDallocCount();
 
   int r = munmap(addr, size);
   if (r == 0) {
     close(it->second.fd.first);
-    g_allocator_instance->mmap_records_.erase(it);
+    g_allocator_instance->GetMmapRecords().erase(it);
   } else {
     RAY_LOG(ERROR) << "munmap failed: " << strerror(errno);
   }
@@ -284,23 +282,30 @@ bool PlasmaExtentDalloc(extent_hooks_t *extent_hooks, void *addr, size_t size,
   return r != 0;
 }
 
-void PlasmaExtentDestroy(extent_hooks_t *extent_hooks, void *addr, size_t size,
-                        bool committed, unsigned arena_ind) {
+void PlasmaExtentDestroy(extent_hooks_t *extent_hooks,
+                         void *addr,
+                         size_t size,
+                         bool committed,
+                         unsigned arena_ind) {
   // Retreat pointer to actual location
-  addr = pointer_retreat(addr, kMmapRegionsGap);
-  size += kMmapRegionsGap;
+  addr = pointer_retreat(addr, plasma::kMmapRegionsGap);
+  size += plasma::kMmapRegionsGap;
 
   // For uncommitted extents, just unmap
   munmap(addr, size);
 
   if (g_allocator_instance) {
-    absl::MutexLock lock(&g_allocator_instance->mutex_);
-    g_allocator_instance->mmap_records_.erase(addr);
+    absl::MutexLock lock(&g_allocator_instance->GetMutex());
+    g_allocator_instance->GetMmapRecords().erase(addr);
   }
 }
 
-bool PlasmaExtentCommit(extent_hooks_t *extent_hooks, void *addr, size_t size,
-                       size_t offset, size_t length, unsigned arena_ind) {
+bool PlasmaExtentCommit(extent_hooks_t *extent_hooks,
+                        void *addr,
+                        size_t size,
+                        size_t offset,
+                        size_t length,
+                        unsigned arena_ind) {
   // No need to adjust pointer for commit operations
   void *target = static_cast<char *>(addr) + offset;
 
@@ -316,7 +321,7 @@ bool PlasmaExtentCommit(extent_hooks_t *extent_hooks, void *addr, size_t size,
   }
 
   // Enable huge pages if configured
-  if (g_allocator_instance && g_allocator_instance->hugepage_enabled_ &&
+  if (g_allocator_instance && g_allocator_instance->IsHugepageEnabled() &&
       length >= kLargeObjectAlignment) {
     madvise(target, length, MADV_HUGEPAGE);
   }
@@ -324,8 +329,12 @@ bool PlasmaExtentCommit(extent_hooks_t *extent_hooks, void *addr, size_t size,
   return false;
 }
 
-bool PlasmaExtentDecommit(extent_hooks_t *extent_hooks, void *addr, size_t size,
-                          size_t offset, size_t length, unsigned arena_ind) {
+bool PlasmaExtentDecommit(extent_hooks_t *extent_hooks,
+                          void *addr,
+                          size_t size,
+                          size_t offset,
+                          size_t length,
+                          unsigned arena_ind) {
   void *target = static_cast<char *>(addr) + offset;
 
   // Release physical pages
@@ -341,8 +350,7 @@ bool PlasmaExtentDecommit(extent_hooks_t *extent_hooks, void *addr, size_t size,
   return false;
 }
 
-bool PlasmaExtentPurge(extent_hooks_t *extent_hooks, void *addr, size_t size,
-                      size_t offset, size_t length, unsigned arena_ind) {
+static bool PlasmaExtentPurgeImpl(void *addr, size_t size, size_t offset, size_t length) {
   void *target = static_cast<char *>(addr) + offset;
 
 #ifdef MADV_FREE
@@ -358,8 +366,31 @@ bool PlasmaExtentPurge(extent_hooks_t *extent_hooks, void *addr, size_t size,
   return false;
 }
 
-bool PlasmaExtentMerge(extent_hooks_t *extent_hooks, void *addr_a, size_t size_a,
-                      void *addr_b, size_t size_b, bool committed, unsigned arena_ind) {
+bool PlasmaExtentPurgeLazy(extent_hooks_t *extent_hooks,
+                           void *addr,
+                           size_t size,
+                           size_t offset,
+                           size_t length,
+                           unsigned arena_ind) {
+  return PlasmaExtentPurgeImpl(addr, size, offset, length);
+}
+
+bool PlasmaExtentPurgeForced(extent_hooks_t *extent_hooks,
+                             void *addr,
+                             size_t size,
+                             size_t offset,
+                             size_t length,
+                             unsigned arena_ind) {
+  return PlasmaExtentPurgeImpl(addr, size, offset, length);
+}
+
+bool PlasmaExtentMerge(extent_hooks_t *extent_hooks,
+                       void *addr_a,
+                       size_t size_a,
+                       void *addr_b,
+                       size_t size_b,
+                       bool committed,
+                       unsigned arena_ind) {
   if (!g_allocator_instance) {
     return true;
   }
@@ -370,34 +401,39 @@ bool PlasmaExtentMerge(extent_hooks_t *extent_hooks, void *addr_a, size_t size_a
   }
 
   // Retreat pointers to actual locations for tracking
-  void *real_addr_a = pointer_retreat(addr_a, kMmapRegionsGap);
-  void *real_addr_b = pointer_retreat(addr_b, kMmapRegionsGap);
-  size_t real_size_a = size_a + kMmapRegionsGap;
-  size_t real_size_b = size_b + kMmapRegionsGap;
+  void *real_addr_a = pointer_retreat(addr_a, plasma::kMmapRegionsGap);
+  void *real_addr_b = pointer_retreat(addr_b, plasma::kMmapRegionsGap);
+  size_t real_size_a = size_a + plasma::kMmapRegionsGap;
+  size_t real_size_b = size_b + plasma::kMmapRegionsGap;
 
   // Update tracking
   {
-    absl::MutexLock lock(&g_allocator_instance->mutex_);
-    auto it_a = g_allocator_instance->mmap_records_.find(real_addr_a);
-    auto it_b = g_allocator_instance->mmap_records_.find(real_addr_b);
+    absl::MutexLock lock(&g_allocator_instance->GetMutex());
+    auto it_a = g_allocator_instance->GetMmapRecords().find(real_addr_a);
+    auto it_b = g_allocator_instance->GetMmapRecords().find(real_addr_b);
 
-    if (it_a != g_allocator_instance->mmap_records_.end() &&
-        it_b != g_allocator_instance->mmap_records_.end()) {
+    if (it_a != g_allocator_instance->GetMmapRecords().end() &&
+        it_b != g_allocator_instance->GetMmapRecords().end()) {
       // Merge: extend size of first extent, remove second
-      it_a->second.size = real_size_a + real_size_b - kMmapRegionsGap;
-      g_allocator_instance->mmap_records_.erase(it_b);
+      it_a->second.size = real_size_a + real_size_b - plasma::kMmapRegionsGap;
+      g_allocator_instance->GetMmapRecords().erase(it_b);
     }
   }
 
   // Track coalescing metrics
-  g_allocator_instance->coalesce_count_++;
+  g_allocator_instance->IncrementCoalesceCount();
 
   RAY_LOG(DEBUG) << "Merged extents: " << size_a << " + " << size_b << " bytes";
   return false;
 }
 
-bool PlasmaExtentSplit(extent_hooks_t *extent_hooks, void *addr, size_t size,
-                      size_t size_a, size_t size_b, bool committed, unsigned arena_ind) {
+bool PlasmaExtentSplit(extent_hooks_t *extent_hooks,
+                       void *addr,
+                       size_t size,
+                       size_t size_a,
+                       size_t size_b,
+                       bool committed,
+                       unsigned arena_ind) {
   if (!g_allocator_instance) {
     return true;
   }
@@ -408,27 +444,30 @@ bool PlasmaExtentSplit(extent_hooks_t *extent_hooks, void *addr, size_t size,
   }
 
   // Calculate real addresses and sizes
-  void *real_addr = pointer_retreat(addr, kMmapRegionsGap);
-  void *real_addr_b = pointer_advance(real_addr, size_a + kMmapRegionsGap);
+  void *real_addr = pointer_retreat(addr, plasma::kMmapRegionsGap);
+  void *real_addr_b = pointer_advance(real_addr, size_a + plasma::kMmapRegionsGap);
 
   // Update tracking
   {
-    absl::MutexLock lock(&g_allocator_instance->mutex_);
-    auto it = g_allocator_instance->mmap_records_.find(real_addr);
-    if (it != g_allocator_instance->mmap_records_.end()) {
+    absl::MutexLock lock(&g_allocator_instance->GetMutex());
+    auto it = g_allocator_instance->GetMmapRecords().find(real_addr);
+    if (it != g_allocator_instance->GetMmapRecords().end()) {
       MEMFD_TYPE fd = it->second.fd;
 
       // Update first extent size
-      it->second.size = size_a + kMmapRegionsGap;
+      it->second.size = size_a + plasma::kMmapRegionsGap;
 
       // Add second extent
-      g_allocator_instance->mmap_records_[real_addr_b] = {fd,
-                                                          (int64_t)(size_b + kMmapRegionsGap)};
+      g_allocator_instance->GetMmapRecords()[real_addr_b] =
+          JemallocMmapRecord{fd,
+                             static_cast<size_t>(size_b + plasma::kMmapRegionsGap),
+                             std::string(),
+                             false};
     }
   }
 
   // Track split metrics
-  g_allocator_instance->split_count_++;
+  g_allocator_instance->IncrementSplitCount();
 
   RAY_LOG(DEBUG) << "Split extent: " << size << " into " << size_a << " + " << size_b;
   return false;
@@ -436,9 +475,16 @@ bool PlasmaExtentSplit(extent_hooks_t *extent_hooks, void *addr, size_t size,
 
 // Global extent hooks structure
 extent_hooks_t plasma_extent_hooks = {
-    PlasmaExtentAlloc,    PlasmaExtentDalloc,  PlasmaExtentDestroy,
-    PlasmaExtentCommit,   PlasmaExtentDecommit, PlasmaExtentPurge,
-    PlasmaExtentMerge,    PlasmaExtentSplit};
+    PlasmaExtentAlloc,        // alloc
+    PlasmaExtentDalloc,       // dalloc
+    PlasmaExtentDestroy,      // destroy
+    PlasmaExtentCommit,       // commit
+    PlasmaExtentDecommit,     // decommit
+    PlasmaExtentPurgeLazy,    // purge_lazy
+    PlasmaExtentPurgeForced,  // purge_forced
+    PlasmaExtentSplit,        // split
+    PlasmaExtentMerge         // merge
+};
 
 }  // namespace
 
@@ -471,7 +517,9 @@ JemallocAllocator::JemallocAllocator(const std::string &plasma_directory,
 JemallocAllocator::~JemallocAllocator() {
   // Clean up any remaining allocations
   absl::MutexLock lock(&mutex_);
-  for (const auto &[addr, record] : mmap_records_) {
+  for (const auto &entry : mmap_records_) {
+    void *addr = entry.first;
+    const JemallocMmapRecord &record = entry.second;
     munmap(addr, record.size);
     close(record.fd.first);
   }
@@ -485,34 +533,37 @@ void JemallocAllocator::InitializeJemalloc() {
 
   // Reduce extent fragmentation
   size_t lg_extent_max_active_fit = 4;
-  je_mallctl("opt.lg_extent_max_active_fit", nullptr, nullptr,
-             &lg_extent_max_active_fit, sizeof(size_t));
+  mallctl("opt.lg_extent_max_active_fit",
+          nullptr,
+          nullptr,
+          &lg_extent_max_active_fit,
+          sizeof(size_t));
 
   // Set quantum for better alignment with large objects
   size_t lg_quantum = 17;  // 128KB quantum
-  je_mallctl("opt.lg_quantum", nullptr, nullptr, &lg_quantum, sizeof(size_t));
+  mallctl("opt.lg_quantum", nullptr, nullptr, &lg_quantum, sizeof(size_t));
 
   // Configure oversize threshold
   size_t oversize_threshold = 64 * 1024 * 1024;  // 64MB
-  je_mallctl("opt.oversize_threshold", nullptr, nullptr, &oversize_threshold,
-             sizeof(size_t));
+  mallctl(
+      "opt.oversize_threshold", nullptr, nullptr, &oversize_threshold, sizeof(size_t));
 
   // Memory decay settings for better reuse
   ssize_t dirty_decay_ms = 5000;
   ssize_t muzzy_decay_ms = 10000;
-  je_mallctl("opt.dirty_decay_ms", nullptr, nullptr, &dirty_decay_ms, sizeof(ssize_t));
-  je_mallctl("opt.muzzy_decay_ms", nullptr, nullptr, &muzzy_decay_ms, sizeof(ssize_t));
+  mallctl("opt.dirty_decay_ms", nullptr, nullptr, &dirty_decay_ms, sizeof(ssize_t));
+  mallctl("opt.muzzy_decay_ms", nullptr, nullptr, &muzzy_decay_ms, sizeof(ssize_t));
 
   // Enable transparent huge pages if configured
   if (hugepage_enabled_) {
     bool thp_enabled = true;
-    je_mallctl("opt.thp", nullptr, nullptr, &thp_enabled, sizeof(bool));
-    je_mallctl("opt.metadata_thp", nullptr, nullptr, &thp_enabled, sizeof(bool));
+    mallctl("opt.thp", nullptr, nullptr, &thp_enabled, sizeof(bool));
+    mallctl("opt.metadata_thp", nullptr, nullptr, &thp_enabled, sizeof(bool));
   }
 
   // Disable thread cache for large objects
   bool tcache_enabled = false;
-  je_mallctl("opt.tcache", nullptr, nullptr, &tcache_enabled, sizeof(bool));
+  mallctl("opt.tcache", nullptr, nullptr, &tcache_enabled, sizeof(bool));
 
   RAY_LOG(INFO) << "jemalloc configured for large object optimization";
 }
@@ -522,7 +573,7 @@ void JemallocAllocator::InstallExtentHooks() {
   unsigned arena_index;
   size_t sz = sizeof(unsigned);
 
-  if (je_mallctl("arenas.create", &arena_index, &sz, nullptr, 0) != 0) {
+  if (mallctl("arenas.create", &arena_index, &sz, nullptr, 0) != 0) {
     RAY_LOG(FATAL) << "Failed to create jemalloc arena";
   }
 
@@ -532,8 +583,9 @@ void JemallocAllocator::InstallExtentHooks() {
   std::string hooks_key = "arena." + std::to_string(arena_index) + ".extent_hooks";
   extent_hooks_t *hooks_ptr = &plasma_extent_hooks;
 
-  if (je_mallctl(hooks_key.c_str(), nullptr, nullptr, &hooks_ptr,
-                 sizeof(extent_hooks_t *)) != 0) {
+  if (mallctl(
+          hooks_key.c_str(), nullptr, nullptr, &hooks_ptr, sizeof(extent_hooks_t *)) !=
+      0) {
     RAY_LOG(ERROR) << "Failed to install extent hooks";
   }
 
@@ -542,8 +594,8 @@ void JemallocAllocator::InstallExtentHooks() {
 
 std::optional<Allocation> JemallocAllocator::Allocate(size_t bytes) {
   if (bytes < kMinPlasmaObjectSize) {
-    RAY_LOG(WARNING) << "Requested allocation " << bytes
-                     << " bytes is less than minimum " << kMinPlasmaObjectSize;
+    RAY_LOG(WARNING) << "Requested allocation " << bytes << " bytes is less than minimum "
+                     << kMinPlasmaObjectSize;
   }
 
   // Round up to page boundary for better alignment
@@ -560,9 +612,9 @@ std::optional<Allocation> JemallocAllocator::Allocate(size_t bytes) {
     flags |= MALLOCX_ALIGN(kLargeObjectAlignment);
   }
 
-  void *ptr = je_mallocx(aligned_size, flags);
+  void *ptr = mallocx(aligned_size, flags);
   if (!ptr) {
-    RAY_LOG(WARNING) << "Failed to allocate " << aligned_size << " bytes";
+    RAY_LOG(DEBUG) << "Failed to allocate " << aligned_size << " bytes";
     return std::nullopt;
   }
 
@@ -575,7 +627,8 @@ std::optional<Allocation> JemallocAllocator::Allocate(size_t bytes) {
 
 std::optional<Allocation> JemallocAllocator::FallbackAllocate(size_t bytes) {
   if (fallback_directory_.empty()) {
-    RAY_LOG(ERROR) << "Fallback allocation requested but no fallback directory configured";
+    RAY_LOG(ERROR)
+        << "Fallback allocation requested but no fallback directory configured";
     return std::nullopt;
   }
 
@@ -588,18 +641,18 @@ std::optional<Allocation> JemallocAllocator::FallbackAllocate(size_t bytes) {
   // Use custom arena with extent hooks
   int flags = MALLOCX_ARENA(plasma_arena_index_) | MALLOCX_ZERO;
 
-  void *ptr = je_mallocx(aligned_size, flags);
+  void *ptr = mallocx(aligned_size, flags);
 
   // Reset fallback mode flag
   in_fallback_mode = false;
 
   if (!ptr) {
-    RAY_LOG(WARNING) << "Failed to fallback allocate " << aligned_size << " bytes";
+    RAY_LOG(DEBUG) << "Failed to fallback allocate " << aligned_size << " bytes";
     return std::nullopt;
   }
 
   // Check if this allocation is actually outside the initial region
-  void *real_ptr = pointer_retreat(ptr, kMmapRegionsGap);
+  void *real_ptr = pointer_retreat(ptr, plasma::kMmapRegionsGap);
   bool is_outside = IsOutsideInitialAllocation(real_ptr);
 
   allocated_ += aligned_size;
@@ -619,7 +672,7 @@ void JemallocAllocator::Free(Allocation allocation) {
   size_t size = allocation.size_;
 
   // Use sized deallocation for efficiency
-  je_sdallocx(allocation.address_, size, 0);
+  sdallocx(allocation.address_, size, 0);
 
   allocated_ -= size;
   if (allocation.fallback_allocated_) {
@@ -632,7 +685,7 @@ void JemallocAllocator::Free(Allocation allocation) {
 int64_t JemallocAllocator::Allocated() const {
   // Query jemalloc for accurate stats
   size_t allocated, sz = sizeof(size_t);
-  je_mallctl("stats.allocated", &allocated, &sz, nullptr, 0);
+  mallctl("stats.allocated", &allocated, &sz, nullptr, 0);
   return allocated;
 }
 
@@ -640,16 +693,16 @@ JemallocAllocator::MemoryStats JemallocAllocator::GetStats() const {
   MemoryStats stats;
   size_t sz = sizeof(size_t);
 
-  je_mallctl("stats.allocated", &stats.allocated_bytes, &sz, nullptr, 0);
-  je_mallctl("stats.active", &stats.active_bytes, &sz, nullptr, 0);
-  je_mallctl("stats.metadata", &stats.metadata_bytes, &sz, nullptr, 0);
-  je_mallctl("stats.resident", &stats.resident_bytes, &sz, nullptr, 0);
-  je_mallctl("stats.retained", &stats.retained_bytes, &sz, nullptr, 0);
+  mallctl("stats.allocated", &stats.allocated_bytes, &sz, nullptr, 0);
+  mallctl("stats.active", &stats.active_bytes, &sz, nullptr, 0);
+  mallctl("stats.metadata", &stats.metadata_bytes, &sz, nullptr, 0);
+  mallctl("stats.resident", &stats.resident_bytes, &sz, nullptr, 0);
+  mallctl("stats.retained", &stats.retained_bytes, &sz, nullptr, 0);
 
   // Calculate fragmentation ratio
   if (stats.active_bytes > 0) {
-    stats.fragmentation_ratio =
-        1.0 - (double)stats.allocated_bytes / stats.active_bytes;
+    stats.fragmentation_ratio = 1.0 - static_cast<double>(stats.allocated_bytes) /
+                                          static_cast<double>(stats.active_bytes);
   } else {
     stats.fragmentation_ratio = 0.0;
   }
@@ -665,20 +718,16 @@ void JemallocAllocator::RecordMetrics() const {
 
   // Record basic allocator statistics
   ray::stats::STATS_object_store_memory.Record(
-      stats.allocated_bytes,
-      {{ray::stats::LocationKey, "jemalloc_allocated"}});
+      stats.allocated_bytes, {{ray::stats::LocationKey, "jemalloc_allocated"}});
 
   ray::stats::STATS_object_store_memory.Record(
-      stats.active_bytes,
-      {{ray::stats::LocationKey, "jemalloc_active"}});
+      stats.active_bytes, {{ray::stats::LocationKey, "jemalloc_active"}});
 
   ray::stats::STATS_object_store_memory.Record(
-      stats.resident_bytes,
-      {{ray::stats::LocationKey, "jemalloc_resident"}});
+      stats.resident_bytes, {{ray::stats::LocationKey, "jemalloc_resident"}});
 
   ray::stats::STATS_object_store_memory.Record(
-      stats.metadata_bytes,
-      {{ray::stats::LocationKey, "jemalloc_metadata"}});
+      stats.metadata_bytes, {{ray::stats::LocationKey, "jemalloc_metadata"}});
 
   // Record fragmentation as a percentage (0-100)
   ray::stats::STATS_object_store_memory.Record(
@@ -692,20 +741,17 @@ void JemallocAllocator::RecordMetrics() const {
 
   // Record extent operation counts
   ray::stats::STATS_object_store_memory.Record(
-      extent_alloc_count_.load(),
-      {{ray::stats::LocationKey, "jemalloc_extent_allocs"}});
+      extent_alloc_count_.load(), {{ray::stats::LocationKey, "jemalloc_extent_allocs"}});
 
   ray::stats::STATS_object_store_memory.Record(
       extent_dalloc_count_.load(),
       {{ray::stats::LocationKey, "jemalloc_extent_deallocs"}});
 
   ray::stats::STATS_object_store_memory.Record(
-      coalesce_count_.load(),
-      {{ray::stats::LocationKey, "jemalloc_coalesce_ops"}});
+      coalesce_count_.load(), {{ray::stats::LocationKey, "jemalloc_coalesce_ops"}});
 
   ray::stats::STATS_object_store_memory.Record(
-      split_count_.load(),
-      {{ray::stats::LocationKey, "jemalloc_split_ops"}});
+      split_count_.load(), {{ray::stats::LocationKey, "jemalloc_split_ops"}});
 
   ray::stats::STATS_object_store_memory.Record(
       fallback_alloc_count_.load(),
@@ -744,29 +790,41 @@ void JemallocAllocator::GetDebugDump(std::stringstream &buffer) const {
   buffer << "- Active mappings: " << mmap_records_.size() << "\n";
 
   int64_t total_mapped = 0;
-  for (const auto &[addr, record] : mmap_records_) {
+  for (const auto &entry : mmap_records_) {
+    const JemallocMmapRecord &record = entry.second;
     total_mapped += record.size;
   }
   buffer << "- Total mapped: " << total_mapped << " bytes\n";
 }
 
-std::optional<Allocation> JemallocAllocator::BuildAllocation(void *addr, size_t size,
-                                                            bool is_fallback_allocated) {
+std::optional<Allocation> JemallocAllocator::BuildAllocation(void *addr,
+                                                             size_t size,
+                                                             bool is_fallback_allocated) {
   if (!addr) {
     return std::nullopt;
   }
 
   // The address from jemalloc is already adjusted, retreat to get real address
-  void *real_addr = pointer_retreat(addr, kMmapRegionsGap);
+  void *real_addr = pointer_retreat(addr, plasma::kMmapRegionsGap);
 
   absl::MutexLock lock(&mutex_);
-  auto it = mmap_records_.find(real_addr);
-  if (it != mmap_records_.end()) {
-    // Calculate offset from the real mmap base
-    ptrdiff_t offset = kMmapRegionsGap;
-
-    return Allocation(addr, size, it->second.fd, offset, 0,
-                     it->second.size - kMmapRegionsGap, is_fallback_allocated);
+  // Find the mapping whose range contains this real address.
+  for (const auto &entry : mmap_records_) {
+    void *base = entry.first;
+    const JemallocMmapRecord &rec = entry.second;
+    char *b = static_cast<char *>(base);
+    char *e = b + rec.size;  // recorded size includes the gap we added
+    char *p = static_cast<char *>(real_addr);
+    if (p >= b && p < e) {
+      ptrdiff_t offset = p - b;  // distance from mmap base
+      return std::optional<Allocation>(Allocation(addr,
+                                                  static_cast<int64_t>(size),
+                                                  rec.fd,
+                                                  offset,
+                                                  0,
+                                                  static_cast<int64_t>(rec.size),
+                                                  is_fallback_allocated));
+    }
   }
 
   RAY_LOG(WARNING) << "Address " << real_addr << " not found in mmap_records";

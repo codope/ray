@@ -18,6 +18,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <string>
 
 #include "absl/container/flat_hash_map.h"
@@ -25,11 +27,20 @@
 #include "absl/types/optional.h"
 #include "ray/object_manager/plasma/allocator.h"
 #include "ray/object_manager/plasma/common.h"
+#include "ray/util/compat.h"
 
-// Forward declare jemalloc types
-typedef struct extent_hooks_s extent_hooks_t;
+// Use official jemalloc API
+#include <jemalloc/jemalloc.h>
 
 namespace plasma {
+
+// Forward declare MmapRecord to avoid conflicts with malloc.h
+struct JemallocMmapRecord {
+  MEMFD_TYPE fd;     ///< File descriptor pair for the memory mapping
+  size_t size;       ///< Size of the memory mapping in bytes
+  std::string path;  ///< File path for the memory mapping
+  bool is_fallback;  ///< Whether this is fallback allocation
+};
 
 /// JemallocAllocator optimized for large object allocation (>=100KB).
 /// This allocator uses jemalloc with custom extent hooks to manage
@@ -95,6 +106,21 @@ class JemallocAllocator : public IAllocator {
   /// Get debug information for troubleshooting.
   void GetDebugDump(std::stringstream &buffer) const;
 
+  // Public accessors for extent hooks (needed for friend functions)
+  const std::string &GetPlasmaDirectory() const { return plasma_directory_; }
+  const std::string &GetFallbackDirectory() const { return fallback_directory_; }
+  bool IsHugepageEnabled() const { return hugepage_enabled_; }
+  absl::Mutex &GetMutex() const { return mutex_; }
+  absl::flat_hash_map<void *, JemallocMmapRecord> &GetMmapRecords()
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_) {
+    return mmap_records_;
+  }
+  void IncrementExtentAllocCount() { extent_alloc_count_++; }
+  void IncrementFallbackAllocCount() { fallback_alloc_count_++; }
+  void IncrementExtentDallocCount() { extent_dalloc_count_++; }
+  void IncrementCoalesceCount() { coalesce_count_++; }
+  void IncrementSplitCount() { split_count_++; }
+
  private:
   /// Initialize jemalloc with optimal configuration for large objects.
   void InitializeJemalloc();
@@ -104,8 +130,8 @@ class JemallocAllocator : public IAllocator {
 
   /// Build an Allocation object from raw memory pointer.
   std::optional<Allocation> BuildAllocation(void *addr,
-                                           size_t size,
-                                           bool is_fallback_allocated);
+                                            size_t size,
+                                            bool is_fallback_allocated);
 
   // Configuration
   const std::string plasma_directory_;
@@ -131,26 +157,26 @@ class JemallocAllocator : public IAllocator {
   mutable absl::Mutex mutex_;
 
   // Track memory mappings for client access
-  absl::flat_hash_map<void *, MmapRecord> mmap_records_ ABSL_GUARDED_BY(mutex_);
+  absl::flat_hash_map<void *, JemallocMmapRecord> mmap_records_ ABSL_GUARDED_BY(mutex_);
 
   // Custom extent hooks for jemalloc
   std::unique_ptr<extent_hooks_t> extent_hooks_;
 
   // Friend functions for extent hook callbacks
-  friend void *PlasmaExtentAlloc(extent_hooks_t *, void *, size_t, size_t, bool *,
-                                 bool *, unsigned);
+  friend void *PlasmaExtentAlloc(
+      extent_hooks_t *, void *, size_t, size_t, bool *, bool *, unsigned);
   friend bool PlasmaExtentDalloc(extent_hooks_t *, void *, size_t, bool, unsigned);
   friend void PlasmaExtentDestroy(extent_hooks_t *, void *, size_t, bool, unsigned);
-  friend bool PlasmaExtentCommit(extent_hooks_t *, void *, size_t, size_t, size_t,
-                                 unsigned);
-  friend bool PlasmaExtentDecommit(extent_hooks_t *, void *, size_t, size_t, size_t,
-                                   unsigned);
-  friend bool PlasmaExtentPurge(extent_hooks_t *, void *, size_t, size_t, size_t,
-                                unsigned);
-  friend bool PlasmaExtentMerge(extent_hooks_t *, void *, size_t, void *, size_t, bool,
-                                unsigned);
-  friend bool PlasmaExtentSplit(extent_hooks_t *, void *, size_t, size_t, size_t, bool,
-                                unsigned);
+  friend bool PlasmaExtentCommit(
+      extent_hooks_t *, void *, size_t, size_t, size_t, unsigned);
+  friend bool PlasmaExtentDecommit(
+      extent_hooks_t *, void *, size_t, size_t, size_t, unsigned);
+  friend bool PlasmaExtentPurge(
+      extent_hooks_t *, void *, size_t, size_t, size_t, unsigned);
+  friend bool PlasmaExtentMerge(
+      extent_hooks_t *, void *, size_t, void *, size_t, bool, unsigned);
+  friend bool PlasmaExtentSplit(
+      extent_hooks_t *, void *, size_t, size_t, size_t, bool, unsigned);
 };
 
 }  // namespace plasma

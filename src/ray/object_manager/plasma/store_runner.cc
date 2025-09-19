@@ -180,11 +180,11 @@ void PlasmaStoreRunner::RecordAllocatorMetrics() const {
   }
 
   // Try to cast to specific allocator types to access enhanced metrics
-  auto *jemalloc_allocator = dynamic_cast<JemallocAllocator*>(allocator_.get());
+  auto *jemalloc_allocator = dynamic_cast<JemallocAllocator *>(allocator_.get());
   if (jemalloc_allocator) {
     jemalloc_allocator->RecordMetrics();
   } else {
-    auto *plasma_allocator = dynamic_cast<PlasmaAllocator*>(allocator_.get());
+    auto *plasma_allocator = dynamic_cast<PlasmaAllocator *>(allocator_.get());
     if (plasma_allocator) {
       plasma_allocator->RecordMetrics();
     }

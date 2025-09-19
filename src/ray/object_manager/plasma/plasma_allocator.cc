@@ -188,7 +188,8 @@ PlasmaAllocator::MemoryStats PlasmaAllocator::GetStats() const {
   // This is a rough estimate since dlmalloc doesn't expose detailed fragmentation info
   int64_t used_space = allocated_ + kDlMallocReserved;
   if (kFootprintLimit > 0 && used_space > 0) {
-    stats.fragmentation_estimate = 1.0 - (double)used_space / kFootprintLimit;
+    stats.fragmentation_estimate =
+        1.0 - static_cast<double>(used_space) / static_cast<double>(kFootprintLimit);
     // Clamp to reasonable bounds
     if (stats.fragmentation_estimate < 0) stats.fragmentation_estimate = 0.0;
     if (stats.fragmentation_estimate > 1) stats.fragmentation_estimate = 1.0;
@@ -204,12 +205,10 @@ void PlasmaAllocator::RecordMetrics() const {
 
   // Record basic allocator statistics - using dlmalloc prefix for distinction
   ray::stats::STATS_object_store_memory.Record(
-      stats.allocated_bytes,
-      {{ray::stats::LocationKey, "dlmalloc_allocated"}});
+      stats.allocated_bytes, {{ray::stats::LocationKey, "dlmalloc_allocated"}});
 
   ray::stats::STATS_object_store_memory.Record(
-      stats.footprint_limit,
-      {{ray::stats::LocationKey, "dlmalloc_footprint_limit"}});
+      stats.footprint_limit, {{ray::stats::LocationKey, "dlmalloc_footprint_limit"}});
 
   ray::stats::STATS_object_store_memory.Record(
       stats.fallback_allocated_bytes,
@@ -222,12 +221,10 @@ void PlasmaAllocator::RecordMetrics() const {
 
   // Record operation counts
   ray::stats::STATS_object_store_memory.Record(
-      stats.total_alloc_count,
-      {{ray::stats::LocationKey, "dlmalloc_total_allocs"}});
+      stats.total_alloc_count, {{ray::stats::LocationKey, "dlmalloc_total_allocs"}});
 
   ray::stats::STATS_object_store_memory.Record(
-      stats.total_free_count,
-      {{ray::stats::LocationKey, "dlmalloc_total_frees"}});
+      stats.total_free_count, {{ray::stats::LocationKey, "dlmalloc_total_frees"}});
 
   ray::stats::STATS_object_store_memory.Record(
       stats.fallback_alloc_count,
@@ -250,8 +247,10 @@ void PlasmaAllocator::GetDebugDump(std::stringstream &buffer) const {
   buffer << "=== Memory Statistics ===\n";
   buffer << "- Allocated: " << stats.allocated_bytes << " bytes\n";
   buffer << "- Fallback allocated: " << stats.fallback_allocated_bytes << " bytes\n";
-  buffer << "- Fragmentation estimate: " << (stats.fragmentation_estimate * 100.0) << "%\n";
-  buffer << "- Available: " << (stats.footprint_limit - stats.allocated_bytes) << " bytes\n";
+  buffer << "- Fragmentation estimate: " << (stats.fragmentation_estimate * 100.0)
+         << "%\n";
+  buffer << "- Available: " << (stats.footprint_limit - stats.allocated_bytes)
+         << " bytes\n";
   buffer << "\n";
 
   buffer << "=== Operation Counts ===\n";

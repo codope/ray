@@ -28,8 +28,6 @@
 
 #include "ray/object_manager/plasma/store.h"
 
-#include "ray/object_manager/plasma/plasma_allocator.h"
-
 #include <boost/bind/bind.hpp>
 #include <chrono>
 #include <climits>
@@ -584,7 +582,7 @@ void PlasmaStore::ScheduleRecordMetrics() const {
   object_lifecycle_mgr_.RecordMetrics();
 
   // Record allocator-specific metrics for PlasmaAllocator
-  auto *plasma_allocator = dynamic_cast<const PlasmaAllocator*>(&allocator_);
+  auto *plasma_allocator = dynamic_cast<const PlasmaAllocator *>(&allocator_);
   if (plasma_allocator) {
     plasma_allocator->RecordMetrics();
   }
