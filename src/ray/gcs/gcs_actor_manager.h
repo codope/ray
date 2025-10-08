@@ -517,6 +517,10 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler {
   absl::flat_hash_map<WorkerID, std::shared_ptr<boost::asio::deadline_timer>>
       graceful_shutdown_timers_;
 
+  /// Actors with deferred cleanup (marked in DestroyActor with defer_cleanup=true).
+  /// Only these actors should have cleanup performed in RestartActor.
+  absl::flat_hash_set<ActorID> actors_with_deferred_cleanup_;
+
   // Debug info.
   enum CountType {
     REGISTER_ACTOR_REQUEST = 0,
