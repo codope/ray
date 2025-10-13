@@ -22,7 +22,6 @@
 #include <atomic>
 #include <cstring>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include "ray/common/ray_config.h"
@@ -45,8 +44,8 @@ constexpr size_t kMinPlasmaObjectSize = 100 * 1024;
 
 // Note: plasma::kMmapRegionsGap is defined in malloc.h
 
-// Track whether we've allocated the initial pool - process-wide
-static std::atomic<bool> pool_allocated{false};
+// Track whether we've allocated once (for fallback logic) - process-wide
+static bool allocated_once = false;
 
 // Give each mmap record a unique id to disambiguate fd reuse - process-wide
 static int64_t next_mmap_unique_id = INVALID_UNIQUE_FD_ID + 1;
@@ -60,6 +59,12 @@ static JemallocAllocator *g_allocator_instance = nullptr;
 
 // Process-wide flag to indicate we're in fallback allocation mode
 static std::atomic<bool> in_fallback_mode{false};
+
+// Track the single pre-allocated pool for extent hooks
+static bool pool_allocated = false;
+static void *pool_base = nullptr;
+static size_t pool_size = 0;
+static int pool_fd = -1;
 
 // Helper functions
 void *pointer_advance(void *p, ptrdiff_t n) {
@@ -81,8 +86,8 @@ void create_and_mmap_buffer(int64_t size,
   // Choose directory based on allocation mode
   std::string file_template = plasma_directory;
 
-  // If we've allocated the pool and fallback is enabled, use fallback directory
-  if (pool_allocated && fallback_enabled && in_fallback_mode) {
+  // If we've allocated once and fallback is enabled, use fallback directory
+  if (allocated_once && fallback_enabled && in_fallback_mode) {
     file_template = fallback_directory;
     RAY_LOG(INFO) << "Using fallback directory for allocation";
   }
@@ -131,7 +136,7 @@ void create_and_mmap_buffer(int64_t size,
 
 #ifdef __linux__
   // For fallback allocation, use fallocate to ensure no SIGBUS
-  if (pool_allocated && fallback_enabled && in_fallback_mode) {
+  if (allocated_once && fallback_enabled && in_fallback_mode) {
     RAY_LOG(DEBUG) << "Preallocating fallback allocation using fallocate";
     int ret = fallocate(*fd, 0, 0, size);
     if (ret != 0) {
@@ -155,7 +160,7 @@ void create_and_mmap_buffer(int64_t size,
       RAY_LOG(ERROR) << "  (may need to increase /proc/sys/vm/nr_hugepages)";
     }
     close(*fd);
-  } else if (!pool_allocated) {
+  } else if (!allocated_once) {
     // Track the initial region for fallback detection
     initial_region_ptr = *pointer;
     initial_region_size = size;
@@ -174,14 +179,14 @@ void create_and_mmap_buffer(int64_t size,
 }
 
 // Check if pointer is outside the initial allocation
-bool IsOutsideInitialAllocation(void *p) {
-  if (initial_region_ptr == nullptr) {
-    return false;
-  }
-  char *ptr = static_cast<char *>(p);
-  char *initial_end = static_cast<char *>(initial_region_ptr) + initial_region_size;
-  return (ptr < initial_region_ptr) || (ptr >= initial_end);
-}
+// bool IsOutsideInitialAllocation(void *p) {
+//   if (initial_region_ptr == nullptr) {
+//     return false;
+//   }
+//   char *ptr = static_cast<char *>(p);
+//   char *initial_end = static_cast<char *>(initial_region_ptr) + initial_region_size;
+//   return (ptr < initial_region_ptr) || (ptr >= initial_end);
+// }
 
 // Extent hook functions that will be registered with jemalloc
 void *PlasmaExtentAlloc(extent_hooks_t *extent_hooks,
@@ -195,72 +200,60 @@ void *PlasmaExtentAlloc(extent_hooks_t *extent_hooks,
     return nullptr;
   }
 
-  // Pre-allocation strategy: allocate entire pool on first call
-  bool expected = false;
-  if (!pool_allocated.compare_exchange_strong(expected, true)) {
-    // Pool already allocated, refuse additional extents
-    // This forces jemalloc to subdivide the existing pool internally
-    RAY_LOG(DEBUG)
-        << "PlasmaExtentAlloc: refusing extent allocation (pool already allocated)"
-        << " requested size: " << size;
+  // Single-pool strategy: allocate entire pool on first call, return nullptr after
+  if (!pool_allocated) {
+    // First allocation: create the entire memory pool
+    size_t total_size =
+        g_allocator_instance->GetFootprintLimit() + plasma::kMmapRegionsGap;
+
+    void *pointer;
+    int fd;
+    create_and_mmap_buffer(total_size,
+                           &pointer,
+                           &fd,
+                           g_allocator_instance->GetPlasmaDirectory(),
+                           g_allocator_instance->GetFallbackDirectory(),
+                           g_allocator_instance->IsHugepageEnabled(),
+                           false);  // Not fallback for main pool
+
+    if (pointer == MAP_FAILED) {
+      RAY_LOG(ERROR) << "Failed to allocate main memory pool of " << total_size
+                     << " bytes";
+      return nullptr;
+    }
+
+    // Store pool information
+    pool_allocated = true;
+    pool_base = pointer;
+    pool_size = total_size;
+    pool_fd = fd;
+
+    // Update metrics
+    g_allocator_instance->IncrementExtentAllocCount();
+
+    // Track the mapping for compatibility
+    {
+      absl::MutexLock lock(&g_allocator_instance->GetMutex());
+      JemallocMmapRecord &record = g_allocator_instance->GetMmapRecords()[pointer];
+      record.fd = MEMFD_TYPE(fd, next_mmap_unique_id++);
+      record.size = total_size;
+    }
+
+    // Advance pointer by gap amount (lie to jemalloc about actual location)
+    void *adjusted_pointer = pointer_advance(pointer, plasma::kMmapRegionsGap);
+
+    RAY_LOG(INFO) << "PlasmaExtentAlloc: allocated entire pool of " << total_size
+                  << " bytes at " << adjusted_pointer << " (actual: " << pointer << ")";
+
+    *zero = true;
+    *commit = true;
+    return adjusted_pointer;
+  } else {
+    // Subsequent allocations: return nullptr to force jemalloc to subdivide existing pool
+    RAY_LOG(DEBUG) << "PlasmaExtentAlloc: returning nullptr for size " << size
+                   << " (pool already allocated, forcing subdivision)";
     return nullptr;
   }
-
-  // First allocation: create the entire memory pool at once
-  // Override requested size with the full footprint limit
-  size_t pool_size = g_allocator_instance->GetFootprintLimit();
-
-  // Add gap to prevent coalescing (same as dlmalloc)
-  pool_size += plasma::kMmapRegionsGap;
-
-  RAY_LOG(INFO) << "PlasmaExtentAlloc: pre-allocating entire pool of "
-                << (pool_size - plasma::kMmapRegionsGap) << " bytes"
-                << " (requested: " << size << " bytes)";
-
-  // Check if this is a fallback allocation
-  bool is_fallback =
-      in_fallback_mode && g_allocator_instance->GetFallbackDirectory() != "";
-
-  void *pointer;
-  int fd;
-  create_and_mmap_buffer(pool_size,
-                         &pointer,
-                         &fd,
-                         g_allocator_instance->GetPlasmaDirectory(),
-                         g_allocator_instance->GetFallbackDirectory(),
-                         g_allocator_instance->IsHugepageEnabled(),
-                         is_fallback);
-
-  if (pointer == MAP_FAILED) {
-    // Reset flag on failure so we can retry
-    pool_allocated = false;
-    return nullptr;
-  }
-
-  // Update metrics
-  g_allocator_instance->IncrementExtentAllocCount();
-  if (is_fallback) {
-    g_allocator_instance->IncrementFallbackAllocCount();
-  }
-
-  // Track the mapping
-  {
-    absl::MutexLock lock(&g_allocator_instance->GetMutex());
-    JemallocMmapRecord &record = g_allocator_instance->GetMmapRecords()[pointer];
-    record.fd = MEMFD_TYPE(fd, next_mmap_unique_id++);
-    record.size = pool_size;
-  }
-
-  // Advance pointer by gap amount (lie to jemalloc about actual location)
-  void *adjusted_pointer = pointer_advance(pointer, plasma::kMmapRegionsGap);
-
-  RAY_LOG(INFO) << "PlasmaExtentAlloc: successfully allocated pool at "
-                << adjusted_pointer << " (actual: " << pointer << ")"
-                << " size: " << pool_size << " bytes";
-
-  *zero = true;
-  *commit = true;
-  return adjusted_pointer;
 }
 
 bool PlasmaExtentDalloc(extent_hooks_t *extent_hooks,
@@ -272,16 +265,43 @@ bool PlasmaExtentDalloc(extent_hooks_t *extent_hooks,
     return true;
   }
 
-  // With pre-allocation, we should never deallocate the main pool extent
-  // Jemalloc will only call this when it's trying to return memory to the OS
-  // which we don't want with our pre-allocated pool strategy
+  // Retreat pointer to actual location
+  void *real_addr = pointer_retreat(addr, plasma::kMmapRegionsGap);
+  size_t real_size = size + plasma::kMmapRegionsGap;
 
-  RAY_LOG(DEBUG) << "PlasmaExtentDalloc: refusing to deallocate extent at " << addr
-                 << " size " << size << " (using pre-allocated pool)";
+  // Check if this is the entire pool being deallocated
+  if (pool_allocated && real_addr == pool_base && real_size == pool_size) {
+    RAY_LOG(INFO) << "PlasmaExtentDalloc: deallocating entire pool of " << real_size
+                  << " bytes at " << real_addr;
 
-  // Return true (failure) to prevent jemalloc from deallocating
-  // This keeps all memory within our pre-allocated pool
-  return true;
+    // Update metrics
+    g_allocator_instance->IncrementExtentDallocCount();
+
+    // Actually free the pool
+    int r = munmap(real_addr, real_size);
+    if (r == 0) {
+      close(pool_fd);
+      pool_allocated = false;
+      pool_base = nullptr;
+      pool_size = 0;
+      pool_fd = -1;
+
+      // Remove from mmap_records
+      absl::MutexLock lock(&g_allocator_instance->GetMutex());
+      g_allocator_instance->GetMmapRecords().erase(real_addr);
+    } else {
+      RAY_LOG(ERROR) << "munmap failed: " << strerror(errno);
+    }
+
+    return r != 0;
+  } else {
+    // This is a subdivision of the pool - don't actually deallocate
+    // Return true to indicate we're refusing to deallocate
+    RAY_LOG(DEBUG) << "PlasmaExtentDalloc: refusing to deallocate subdivision at "
+                   << real_addr << ", size " << real_size
+                   << " (keeping memory in jemalloc's control)";
+    return true;
+  }
 }
 
 void PlasmaExtentDestroy(extent_hooks_t *extent_hooks,
@@ -504,12 +524,17 @@ JemallocAllocator::JemallocAllocator(const std::string &plasma_directory,
   g_allocator_instance = this;
 
   // Reset allocation tracking
-  pool_allocated = false;
+  allocated_once = false;
   initial_region_ptr = nullptr;
   initial_region_size = 0;
 
+  // Reset single-pool tracking
+  pool_allocated = false;
+  pool_base = nullptr;
+  pool_size = 0;
+  pool_fd = -1;
+
   InitializeJemalloc();
-  InstallExtentHooks();
 
   RAY_LOG(INFO) << "JemallocAllocator initialized with " << footprint_limit
                 << " bytes limit, plasma_dir=" << plasma_directory
@@ -520,21 +545,24 @@ JemallocAllocator::~JemallocAllocator() {
   // Clean up any remaining allocations
   absl::MutexLock lock(&mutex_);
 
-  // Track which FDs we've already closed (split extents share FDs)
-  std::unordered_set<int> closed_fds;
+  // Clean up the global pool if it exists
+  if (pool_allocated && pool_base && pool_size > 0) {
+    munmap(pool_base, pool_size);
+    close(pool_fd);
+    pool_allocated = false;
+    pool_base = nullptr;
+    pool_size = 0;
+    pool_fd = -1;
+  }
 
+  // Clean up any remaining mmap_records
   for (const auto &entry : mmap_records_) {
     void *addr = entry.first;
     const JemallocMmapRecord &record = entry.second;
-
-    // Unmap the memory
-    munmap(addr, record.size);
-
-    // Close FD only once (avoid double-close for split extents)
-    int fd = record.fd.first;
-    if (closed_fds.find(fd) == closed_fds.end()) {
-      close(fd);
-      closed_fds.insert(fd);
+    // Don't double-free the main pool
+    if (addr != pool_base) {
+      munmap(addr, record.size);
+      close(record.fd.first);
     }
   }
   mmap_records_.clear();
@@ -543,30 +571,45 @@ JemallocAllocator::~JemallocAllocator() {
 }
 
 void JemallocAllocator::InitializeJemalloc() {
-  // Configure jemalloc for large object optimization
+  // Configure jemalloc for single pool behavior with no memory release
 
-  // Reduce extent fragmentation
-  size_t lg_extent_max_active_fit = 4;
-  mallctl("opt.lg_extent_max_active_fit",
+  // Create a dedicated arena for plasma allocations
+  unsigned arena_index;
+  size_t sz = sizeof(unsigned);
+  if (mallctl("arenas.create", &arena_index, &sz, nullptr, 0) != 0) {
+    RAY_LOG(FATAL) << "Failed to create jemalloc arena";
+  }
+  plasma_arena_index_ = arena_index;
+
+  std::string arena_prefix = "arena." + std::to_string(arena_index) + ".";
+
+  // Never release memory back to OS (set decay to -1 means never decay)
+  ssize_t never_decay = -1;
+  mallctl((arena_prefix + "dirty_decay_ms").c_str(),
           nullptr,
           nullptr,
-          &lg_extent_max_active_fit,
+          &never_decay,
+          sizeof(ssize_t));
+  mallctl((arena_prefix + "muzzy_decay_ms").c_str(),
+          nullptr,
+          nullptr,
+          &never_decay,
+          sizeof(ssize_t));
+
+  // Set retain growth limit to our pool size
+  // This prevents the arena from growing beyond our limit
+  size_t retain_limit = footprint_limit_;
+  mallctl((arena_prefix + "retain_grow_limit").c_str(),
+          nullptr,
+          nullptr,
+          &retain_limit,
           sizeof(size_t));
+
+  // Configure for large objects (plasma objects are typically > 100KB)
 
   // Set quantum for better alignment with large objects
   size_t lg_quantum = 17;  // 128KB quantum
   mallctl("opt.lg_quantum", nullptr, nullptr, &lg_quantum, sizeof(size_t));
-
-  // Configure oversize threshold
-  size_t oversize_threshold = 64 * 1024 * 1024;  // 64MB
-  mallctl(
-      "opt.oversize_threshold", nullptr, nullptr, &oversize_threshold, sizeof(size_t));
-
-  // Memory decay settings for better reuse
-  ssize_t dirty_decay_ms = 5000;
-  ssize_t muzzy_decay_ms = 10000;
-  mallctl("opt.dirty_decay_ms", nullptr, nullptr, &dirty_decay_ms, sizeof(ssize_t));
-  mallctl("opt.muzzy_decay_ms", nullptr, nullptr, &muzzy_decay_ms, sizeof(ssize_t));
 
   // Enable transparent huge pages if configured
   if (hugepage_enabled_) {
@@ -575,26 +618,20 @@ void JemallocAllocator::InitializeJemalloc() {
     mallctl("opt.metadata_thp", nullptr, nullptr, &thp_enabled, sizeof(bool));
   }
 
-  // Disable thread cache for large objects
-  bool tcache_enabled = false;
-  mallctl("opt.tcache", nullptr, nullptr, &tcache_enabled, sizeof(bool));
+  // Keep thread cache enabled for better performance
+  // (previous code disabled it, but tcache helps even with large objects)
 
-  RAY_LOG(INFO) << "jemalloc configured for large object optimization";
+  RAY_LOG(INFO) << "jemalloc arena " << arena_index << " configured with retain limit "
+                << retain_limit << " and no memory release";
+
+  // Install custom extent hooks for single-pool management
+  InstallExtentHooks();
 }
 
 void JemallocAllocator::InstallExtentHooks() {
-  // Create a new arena with custom extent hooks
-  unsigned arena_index;
-  size_t sz = sizeof(unsigned);
-
-  if (mallctl("arenas.create", &arena_index, &sz, nullptr, 0) != 0) {
-    RAY_LOG(FATAL) << "Failed to create jemalloc arena";
-  }
-
-  plasma_arena_index_ = arena_index;
-
-  // Install custom extent hooks for the arena
-  std::string hooks_key = "arena." + std::to_string(arena_index) + ".extent_hooks";
+  // Install custom extent hooks for the already created arena
+  std::string hooks_key =
+      "arena." + std::to_string(plasma_arena_index_) + ".extent_hooks";
   extent_hooks_t *hooks_ptr = &plasma_extent_hooks;
 
   if (mallctl(
@@ -603,7 +640,7 @@ void JemallocAllocator::InstallExtentHooks() {
     RAY_LOG(ERROR) << "Failed to install extent hooks";
   }
 
-  RAY_LOG(INFO) << "Installed custom extent hooks for arena " << arena_index;
+  RAY_LOG(INFO) << "Installed custom extent hooks for arena " << plasma_arena_index_;
 }
 
 std::optional<Allocation> JemallocAllocator::Allocate(size_t bytes) {
@@ -665,9 +702,9 @@ std::optional<Allocation> JemallocAllocator::FallbackAllocate(size_t bytes) {
     return std::nullopt;
   }
 
-  // Check if this allocation is actually outside the initial region
-  void *real_ptr = pointer_retreat(ptr, plasma::kMmapRegionsGap);
-  bool is_outside = IsOutsideInitialAllocation(real_ptr);
+  // With single-pool extent hooks, fallback allocations are still from the same pool
+  // Just check if we're near the pool limit
+  bool is_outside = false;  // For single-pool, everything is in the main pool
 
   allocated_ += aligned_size;
   if (is_outside) {
@@ -697,16 +734,9 @@ void JemallocAllocator::Free(Allocation allocation) {
 }
 
 int64_t JemallocAllocator::Allocated() const {
-  // Query arena-specific stats instead of global stats
-  std::string arena_key =
-      "stats.arenas." + std::to_string(plasma_arena_index_) + ".allocated";
-  size_t allocated = 0;
-  size_t sz = sizeof(size_t);
-  if (mallctl(arena_key.c_str(), &allocated, &sz, nullptr, 0) != 0) {
-    RAY_LOG(WARNING) << "Failed to query jemalloc arena stats, falling back to tracked "
-                        "allocated_";
-    return allocated_.load();
-  }
+  // Query jemalloc for accurate stats
+  size_t allocated, sz = sizeof(size_t);
+  mallctl("stats.allocated", &allocated, &sz, nullptr, 0);
   return allocated;
 }
 
@@ -714,25 +744,11 @@ JemallocAllocator::MemoryStats JemallocAllocator::GetStats() const {
   MemoryStats stats;
   size_t sz = sizeof(size_t);
 
-  // Query arena-specific stats instead of global stats
-  std::string arena_prefix = "stats.arenas." + std::to_string(plasma_arena_index_) + ".";
-
-  mallctl((arena_prefix + "allocated").c_str(), &stats.allocated_bytes, &sz, nullptr, 0);
-  // pactive is in pages, need to multiply by page size
-  size_t pactive_pages = 0;
-  mallctl((arena_prefix + "pactive").c_str(), &pactive_pages, &sz, nullptr, 0);
-
-  size_t page_size = 0;
-  mallctl("arenas.page", &page_size, &sz, nullptr, 0);
-
-  stats.active_bytes = pactive_pages * page_size;
-
-  // Metadata is global, not per-arena
+  mallctl("stats.allocated", &stats.allocated_bytes, &sz, nullptr, 0);
+  mallctl("stats.active", &stats.active_bytes, &sz, nullptr, 0);
   mallctl("stats.metadata", &stats.metadata_bytes, &sz, nullptr, 0);
-
-  // Resident and retained are also per-arena
-  mallctl((arena_prefix + "resident").c_str(), &stats.resident_bytes, &sz, nullptr, 0);
-  mallctl((arena_prefix + "retained").c_str(), &stats.retained_bytes, &sz, nullptr, 0);
+  mallctl("stats.resident", &stats.resident_bytes, &sz, nullptr, 0);
+  mallctl("stats.retained", &stats.retained_bytes, &sz, nullptr, 0);
 
   // Calculate fragmentation ratio
   if (stats.active_bytes > 0) {
@@ -839,47 +855,44 @@ std::optional<Allocation> JemallocAllocator::BuildAllocation(void *addr,
     return std::nullopt;
   }
 
-  // The address from jemalloc is already adjusted, retreat to get real address
-  void *real_addr = pointer_retreat(addr, plasma::kMmapRegionsGap);
+  // With single-pool extent hooks, all allocations come from the one pre-allocated pool
+  // The address from jemalloc is already adjusted (has gap), need to check against
+  // adjusted pool
+  if (pool_allocated && pool_base && pool_fd >= 0) {
+    // The pool_base is the real address, but jemalloc works with adjusted addresses
+    void *adjusted_pool_base = pointer_advance(pool_base, plasma::kMmapRegionsGap);
+    void *adjusted_pool_end = pointer_advance(pool_base, pool_size);
 
-  absl::MutexLock lock(&mutex_);
-  // Find the mapping whose range contains this real address.
-  for (const auto &entry : mmap_records_) {
-    void *base = entry.first;
-    const JemallocMmapRecord &rec = entry.second;
-    char *b = static_cast<char *>(base);
-    char *e = b + rec.size;  // recorded size includes the gap we added
-    char *p = static_cast<char *>(real_addr);
-    if (p >= b && p < e) {
-      ptrdiff_t offset = p - b;  // distance from mmap base
-      RAY_LOG(DEBUG) << "BuildAllocation: found address " << addr
-                     << " (real: " << real_addr << ") in mmap at " << base
-                     << " with size " << rec.size << ", offset " << offset;
+    // Check if address is within the adjusted pool range
+    if (addr >= adjusted_pool_base && addr < adjusted_pool_end) {
+      // Calculate offset from the real pool base
+      // addr is adjusted, so we need to account for the gap
+      ptrdiff_t offset =
+          static_cast<char *>(addr) - static_cast<char *>(adjusted_pool_base);
+
+      // Create a unique id for this allocation
+      static std::atomic<int64_t> alloc_unique_id{1};
+      MEMFD_TYPE fd_pair = MEMFD_TYPE(pool_fd, alloc_unique_id++);
+
+      RAY_LOG(DEBUG) << "BuildAllocation: addr " << addr << " is at offset " << offset
+                     << " in pool (pool_base=" << pool_base << ", pool_fd=" << pool_fd
+                     << ")";
+
       return std::optional<Allocation>(Allocation(addr,
                                                   static_cast<int64_t>(size),
-                                                  rec.fd,
+                                                  fd_pair,
                                                   offset,
                                                   0,
-                                                  static_cast<int64_t>(rec.size),
+                                                  static_cast<int64_t>(size),
                                                   is_fallback_allocated));
     }
   }
 
-  // If we reach here, the address is not in any tracked mmap
-  // This could happen if the extent was already fully deallocated
-  RAY_LOG(DEBUG) << "BuildAllocation: address " << real_addr
-                 << " not found in mmap_records (may have been freed). "
-                 << "Tracked mmaps: " << mmap_records_.size();
-
-  // Return a "fake" allocation with invalid FD to allow the operation to continue
-  // This is safe because the memory is still valid (allocated by jemalloc)
-  return std::optional<Allocation>(Allocation(addr,
-                                              static_cast<int64_t>(size),
-                                              {-1, INVALID_UNIQUE_FD_ID},
-                                              0,
-                                              0,
-                                              static_cast<int64_t>(size),
-                                              is_fallback_allocated));
+  // Shouldn't reach here with properly configured single-pool extent hooks
+  RAY_LOG(WARNING) << "Address " << addr << " not found in single pool"
+                   << " (pool_allocated=" << pool_allocated << ", pool_base=" << pool_base
+                   << ", pool_size=" << pool_size << ")";
+  return std::nullopt;
 }
 
 }  // namespace plasma
