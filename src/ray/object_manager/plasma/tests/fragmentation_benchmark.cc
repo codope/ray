@@ -223,7 +223,7 @@ class FragmentationBenchmarkBase : public ::testing::Test {
                                const std::string &allocator_type,
                                size_t object_size,
                                int64_t memory_limit) {
-    BenchmarkResult result;
+    BenchmarkResult result{};  // Value-initialize all members to zero
     result.test_name = test_name;
     result.allocator_type = allocator_type;
     result.object_size = object_size;

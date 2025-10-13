@@ -23,6 +23,7 @@
 #include "ray/common/ray_config.h"
 #include "ray/object_manager/plasma/malloc.h"
 #include "ray/stats/metric_defs.h"
+#include "ray/stats/tag_defs.h"
 #include "ray/util/logging.h"
 
 namespace plasma {
