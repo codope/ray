@@ -42,17 +42,8 @@ constexpr size_t kLargeObjectAlignment = 2 * 1024 * 1024;  // 2MB for huge pages
 // Minimum object size for Plasma (100KB)
 constexpr size_t kMinPlasmaObjectSize = 100 * 1024;
 
-// Note: plasma::kMmapRegionsGap is defined in malloc.h
-
-// Track whether we've allocated once (for fallback logic) - process-wide
-static bool allocated_once = false;
-
 // Give each mmap record a unique id to disambiguate fd reuse - process-wide
 static int64_t next_mmap_unique_id = INVALID_UNIQUE_FD_ID + 1;
-
-// Track the initial allocation region - process-wide
-static void *initial_region_ptr = nullptr;
-static size_t initial_region_size = 0;
 
 // Process-wide pointer to the allocator instance for extent hooks
 static JemallocAllocator *g_allocator_instance = nullptr;
@@ -86,8 +77,8 @@ void create_and_mmap_buffer(int64_t size,
   // Choose directory based on allocation mode
   std::string file_template = plasma_directory;
 
-  // If we've allocated once and fallback is enabled, use fallback directory
-  if (allocated_once && fallback_enabled && in_fallback_mode) {
+  // If fallback is enabled and we're in fallback mode, use fallback directory
+  if (fallback_enabled && in_fallback_mode) {
     file_template = fallback_directory;
     RAY_LOG(INFO) << "Using fallback directory for allocation";
   }
@@ -136,7 +127,7 @@ void create_and_mmap_buffer(int64_t size,
 
 #ifdef __linux__
   // For fallback allocation, use fallocate to ensure no SIGBUS
-  if (allocated_once && fallback_enabled && in_fallback_mode) {
+  if (fallback_enabled && in_fallback_mode) {
     RAY_LOG(DEBUG) << "Preallocating fallback allocation using fallocate";
     int ret = fallocate(*fd, 0, 0, size);
     if (ret != 0) {
@@ -160,10 +151,6 @@ void create_and_mmap_buffer(int64_t size,
       RAY_LOG(ERROR) << "  (may need to increase /proc/sys/vm/nr_hugepages)";
     }
     close(*fd);
-  } else if (!allocated_once) {
-    // Track the initial region for fallback detection
-    initial_region_ptr = *pointer;
-    initial_region_size = size;
   }
 
 #ifdef __linux__
@@ -177,16 +164,6 @@ void create_and_mmap_buffer(int64_t size,
   }
 #endif
 }
-
-// Check if pointer is outside the initial allocation
-// bool IsOutsideInitialAllocation(void *p) {
-//   if (initial_region_ptr == nullptr) {
-//     return false;
-//   }
-//   char *ptr = static_cast<char *>(p);
-//   char *initial_end = static_cast<char *>(initial_region_ptr) + initial_region_size;
-//   return (ptr < initial_region_ptr) || (ptr >= initial_end);
-// }
 
 // Extent hook functions that will be registered with jemalloc
 void *PlasmaExtentAlloc(extent_hooks_t *extent_hooks,
@@ -522,11 +499,6 @@ JemallocAllocator::JemallocAllocator(const std::string &plasma_directory,
 
   // Set thread-local instance pointer
   g_allocator_instance = this;
-
-  // Reset allocation tracking
-  allocated_once = false;
-  initial_region_ptr = nullptr;
-  initial_region_size = 0;
 
   // Reset single-pool tracking
   pool_allocated = false;
