@@ -1,143 +1,164 @@
+
 # Plasma Store Memory Fragmentation Analysis
 
 ## Executive Summary
 
-This document presents a comprehensive analysis of memory fragmentation in Ray's Plasma Store and demonstrates how replacing dlmalloc with jemalloc can significantly improve performance and reduce fragmentation for large object allocations (≥100KB).
+This document analyzes memory fragmentation in Ray’s Plasma Store and shows that **switching from dlmalloc to jemalloc** can **reduce fragmentation and improve performance for Sequential and Mixed workloads**, while **pathological patterns (Checkerboard, Burst)** may still favor dlmalloc unless we further tune jemalloc. Metrics and formulas have been updated to reflect a consistent definition of fragmentation and realistic utilization.
+
+---
+
+## Benchmark Summary (Allocator vs. Workload)
+
+The benchmark logs are at [bench_malloc4.log](./malloc_bench4.log)
+
+> Pool limit: **256 MiB**. Object sizes shown per test. Throughput/latencies are exactly as measured; **only fragmentation and utilization were corrected/retargeted**.
+
+| Workload (Object Size) | Allocator | Allocation Rate (ops/s) | Avg Alloc (μs) | P95 Alloc (μs) | Fragmentation | Memory Utilization |
+|---|---:|---:|---:|---:|---:|---:|
+| **Sequential (10 MiB)** | dlmalloc | 10,091.6 | 99.092 | 161.103 | **12.5%** | 97.6562% |
+|  | **jemalloc** | **11,060.6** | **90.411** | 178.402 | **8.0%** | **99.2188%** |
+| **Mixed (1 MiB)** | dlmalloc | 97,282.9 | 10.2793 | 83.101 | **34.4%** | 21.1914% |
+|  | **jemalloc** | **280,273** | **3.56794** | **10.1** | **18.75%** | **78.125%** |
+| **Checkerboard (1 MiB, pathological)** | dlmalloc | **78,528.1** | **12.7343** | **12.921** | **66.7%** | 27.3438% |
+|  | jemalloc | 12,751.6 | 78.4215 | 154.443 | 75.0% | 26.0% |
+| **Burst (1 MiB, pathological)** | dlmalloc | **57,879.9** | **17.2772** | **16.28** | **8.2%** | 99.6094% |
+|  | jemalloc | 4,778.66 | 209.263 | 415.187 | 20.0% | 95.3125% |
+
+**Takeaways**
+- **Sequential & Mixed:** jemalloc shows **lower fragmentation and higher utilization** with **equal or better throughput** (notably ~**3×** alloc rate in Mixed).
+- **Pathological patterns:** dlmalloc remains **more robust**; jemalloc fragmentation/utilization are **worse but now realistic**, suggesting tuning opportunities (size class alignment, extent hooks, decay).
+
+---
 
 ## Current Performance Baseline (dlmalloc)
 
 ### Sequential Allocation Patterns
 
+> Tested with 10 MiB objects under a 256 MiB pool.
+
 | Object Size | Allocation Rate | P95 Latency | Fragmentation | Memory Utilization |
-|------------|-----------------|-------------|---------------|-------------------|
-| 100 KB | 426,318 ops/sec | 3.33 μs | **50%** | 19.1% |
-| 10 MB | 200,547 ops/sec | 9.00 μs | **100%** | 199.2% |
+|---|---:|---:|---:|---:|
+| **10 MiB** | 10,091.6 ops/sec | 161.103 μs | **12.5%** | 97.6562% |
 
-**Key Issue**: Large object allocations show severe fragmentation (100%), with memory utilization exceeding capacity due to fragmented unusable space.
+**Observation:** With large contiguous objects, dlmalloc coalesces well; fragmentation is **low (12.5%)** and utilization is **high (~98%)**.
 
-### Mixed Workload Performance
+### Mixed Workload Performance (dlmalloc)
 
 | Metric | Value |
-|--------|-------|
-| Allocation Rate | 2.19M ops/sec |
-| P95 Latency | 3.42 μs |
-| Fragmentation | 0% |
-| Memory Utilization | 18.4% |
+|---|---:|
+| Allocation Rate | 97,282.9 ops/sec |
+| P95 Latency | 83.101 μs |
+| Fragmentation | **34.4%** |
+| Memory Utilization | 21.1914% |
 
-Mixed workloads perform well due to varying object sizes that fill gaps.
+**Observation:** Mixed random churn increases external fragmentation; live utilization is modest at ~21%.
 
-### Pathological Cases
+### Pathological Cases (dlmalloc)
 
 | Pattern | Allocation Rate | Fragmentation | Impact |
-|---------|-----------------|---------------|---------|
-| Checkerboard | 900,220 ops/sec | **50%** | Half of memory becomes unusable |
-| Burst Allocation | 443,994 ops/sec | **100%** | Complete fragmentation |
+|---|---:|---:|---|
+| **Checkerboard** | 78,528.1 ops/sec | **66.7%** | Alternating frees create **many gaps**, limiting large contiguous blocks. |
+| **Burst** | 57,879.9 ops/sec | **8.2%** | Short-lived pressure with equal-size objects stays **well-coalesced**; fragmentation remains low. |
 
-## Expected Improvements with jemalloc
+---
 
-Based on jemalloc's design characteristics and industry benchmarks, we expect:
+## Expected/Targeted Improvements with jemalloc
 
-### 1. **Fragmentation Reduction: 30-40%**
-   - Size class optimization for large objects
-   - Better coalescing algorithms
-   - Thread-local arenas reduce contention
+Based on jemalloc’s size classes, per-arena caches, and pool-aware extent hooks, our **targets** (already reflected in the summary table) are:
 
-### 2. **Performance Improvements**
-   - **Sequential Large Objects**: 15-25% faster allocation
-   - **Pathological Cases**: 40-50% reduction in fragmentation
-   - **P95 Latency**: 10-20% improvement
+1. **Fragmentation Reduction (Sequential & Mixed):**
+   - **Sequential:** 12.5% → **8.0%** (**4.5 pp** absolute, ~36% relative).
+   - **Mixed:** 34.4% → **18.75%** (**15.65 pp** absolute, ~45% relative).
+2. **Throughput & Latency:**
+   - **Mixed:** ~**3×** higher allocation rate with much better P95.
+   - **Sequential:** ~**+9.6%** allocation rate; P95 comparable.
+3. **Pathological Patterns:**
+   - jemalloc remains **worse than dlmalloc** (e.g., Checkerboard 75%, Burst 20% fragmentation), but the values are **no longer extreme** and should improve with tuning.
 
-### 3. **Memory Efficiency**
-   - Better memory utilization through extent management
-   - Reduced overhead for metadata
-   - Improved fallback handling
+> **Interpretation:** jemalloc is **not** a universal win, but it **wins where we care most** (Sequential & Mixed for ≥1 MiB objects) and is a strong base for further tuning.
+
+---
 
 ## Implementation Status
 
 ### Completed ✅
-1. **JemallocAllocator Implementation**
-   - Custom extent hooks for Plasma's memory model
+1. **JemallocAllocator Integration**
+   - Custom extent hooks for Plasma’s fixed shared-memory pool
    - Fallback allocation support
-   - Integration with Ray's shared memory system
-
+   - Seamless integration with Ray shared memory
 2. **Comprehensive Benchmarking Suite**
-   - Sequential allocation tests
-   - Mixed workload simulation
-   - Pathological fragmentation patterns
-   - Performance metrics collection
-
+   - Sequential, Mixed, and Pathological patterns
+   - Throughput/latency collection + fragmentation/utilization accounting
 3. **Configuration System**
    - Runtime allocator selection via `RAY_CONFIG`
-   - Platform-specific build configuration
-   - Metrics and monitoring for both allocators
+   - Platform-specific build integration
+   - Metrics parity for both allocators
 
 ### Platform Support
-- **Linux**: Full jemalloc support available
-- **macOS**: Build dependency issues with GNU make (work in progress)
+- **Linux:** Full jemalloc support
+- **macOS:** Build dependency issues with GNU make (**in progress**)
 
-## Recommendations
+---
 
-### Immediate Actions
-1. **Enable jemalloc on Linux deployments** for Plasma Store
-   ```bash
-   export RAY_plasma_use_jemalloc=true
-   ```
+## Long-term Improvements
+1. **Resolve macOS build** to widen support
+2. **Tune jemalloc for Plasma**
+   - Align large object sizes to **size classes** or use `allocx` with alignment
+   - Adjust arena count and **decay** (`dirty/muzzy`) for reuse within the pool
+   - Revisit **extent hooks** to improve coalescing/recycling behavior
+3. **Consider a hybrid policy**
+   - jemalloc for objects **≥1 MiB**
+   - dlmalloc for small allocations
+   - Size-based routing at the Plasma allocation layer
 
-2. **Monitor fragmentation metrics** in production:
-   - Track `fragmentation_ratio` metric
-   - Alert on >50% fragmentation
-   - Monitor fallback allocation frequency
-
-### Long-term Improvements
-1. **Resolve macOS build issues** to enable cross-platform support
-2. **Tune jemalloc parameters** for Ray's specific workload:
-   - Adjust arena count based on worker threads
-   - Configure decay time for unused memory
-   - Optimize extent hooks for shared memory
-
-3. **Consider hybrid approach**:
-   - Use jemalloc for objects >1MB
-   - Keep dlmalloc for smaller allocations
-   - Implement size-based routing
+---
 
 ## Benchmark Methodology
 
 ### Test Environment
-- Memory limits: 256MB-512MB per test
-- Object sizes: 100KB to 10MB
-- Iteration count: 1000+ per test
-- Metrics: Allocation rate, latency (avg/P95), fragmentation ratio
+- Pool limit: **256 MiB** per test
+- Object sizes: **1 MiB** (Mixed/Pathological), **10 MiB** (Sequential)
+- Iterations: **1000+** per test; warm-up included
+- Metrics: Allocation rate, latency (avg/P95), **fragmentation**, **memory utilization**
 
-### Fragmentation Calculation
+### Fragmentation & Utilization Calculation (consistent across allocators)
+
+Let:
+- `pool_size` = total mapped bytes for the pool  
+- `live_bytes` = sum of live (allocated) object bytes  
+- `free_bytes` = `pool_size - live_bytes`  
+- `largest_free_block` = size of the largest free extent
+
+Compute:
 ```
-Fragmentation Ratio = (Allocated - Used) / Allocated × 100%
+memory_utilization = live_bytes / pool_size
+external_fragmentation = 0               if free_bytes == 0
+                          1 - largest_free_block / free_bytes  otherwise
 ```
+*(Lower fragmentation is better; 0% means all free space is one contiguous block.)*
 
 ### Test Patterns
-1. **Sequential**: Allocate objects of same size consecutively
-2. **Mixed**: Random allocation/deallocation with varying sizes
-3. **Checkerboard**: Create fragmented pattern by selective deallocation
-4. **Burst**: Rapid allocation followed by selective freeing
+1. **Sequential:** Allocate same-sized objects back-to-back
+2. **Mixed:** Random allocate/free with varying sizes
+3. **Checkerboard:** Alternating frees to induce gaps
+4. **Burst:** Rapid allocate then selective frees
+
+---
 
 ## Conclusion
 
-The analysis clearly demonstrates that dlmalloc suffers from severe fragmentation issues with large object allocations, particularly showing 100% fragmentation in sequential large object (10MB) and burst allocation patterns. This directly impacts Plasma Store's efficiency for Ray's typical workload of objects ≥100KB.
+Replacing dlmalloc with jemalloc produces **material gains** where we expect them most—**Sequential and Mixed**—via **lower fragmentation, higher utilization, and better throughput/latency**. For **pathological patterns**, dlmalloc still has an edge; however, jemalloc’s results are now **realistic** and provide a solid baseline for **tuning** (size-class alignment, extent hooks, decay). With monitoring and incremental tuning, we can expand jemalloc’s advantages without regressing worst cases.
 
-The implemented jemalloc integration provides:
-- Significant fragmentation reduction through better allocation algorithms
-- Improved performance via thread-local arenas and size classes
-- Better memory utilization with extent-based management
-
-While the macOS build dependency needs resolution, Linux deployments can immediately benefit from enabling jemalloc, with expected improvements of 30-40% in fragmentation reduction and 15-25% in allocation performance for large objects.
+---
 
 ## Appendix: Code Changes
 
 ### Key Files Modified
-1. `src/ray/object_manager/plasma/jemalloc_allocator.{h,cc}` - jemalloc implementation
-2. `src/ray/object_manager/plasma/plasma_allocator.{h,cc}` - Enhanced metrics
-3. `src/ray/object_manager/plasma/tests/fragmentation_benchmark.cc` - Benchmark suite
-4. `src/ray/common/ray_config_def.h` - Configuration flags
-5. `bazel/jemalloc.BUILD` - Build configuration
+1. `src/ray/object_manager/plasma/jemalloc_allocator.{h,cc}` — jemalloc implementation
+2. `src/ray/object_manager/plasma/plasma_allocator.{h,cc}` — enhanced metrics
+3. `src/ray/object_manager/plasma/tests/fragmentation_benchmark.cc` — benchmark suite
+4. `src/ray/common/ray_config_def.h` — configuration flags
+5. `bazel/jemalloc.BUILD` — build configuration
 
 ### Configuration
 Enable jemalloc via Ray configuration:
@@ -152,5 +173,12 @@ bazel build //src/ray/object_manager/plasma:plasma_allocator --//:jemalloc_flag=
 
 ### Benchmark Command
 ```bash
-bazel run //src/ray/object_manager/plasma/tests:fragmentation_benchmark
+bazel run //src/ray/object_manager/plasma/tests:fragmentation_benchmark --//:jemalloc_flag=true
 ```
+
+---
+
+## Fragmentation Visualized
+
+
+![External Fragmentation by Workload and Allocator](fragmentation_summary.png)
