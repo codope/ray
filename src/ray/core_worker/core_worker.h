@@ -250,8 +250,19 @@ class CoreWorker {
   ///
   void Shutdown();
 
+  /// Initialize the shutdown coordinator. Must be called after construction
+  /// when the CoreWorker is wrapped in a shared_ptr.
+  /// \param self Weak pointer to this CoreWorker instance
+  void InitializeShutdownCoordinator(std::weak_ptr<CoreWorker> self);
+
   /// Start receiving and executing tasks.
   void RunTaskExecutionLoop();
+
+  /// Get the shutdown coordinator for explicit shutdown management.
+  /// Used by CoreWorkerProcessImpl to wait for shutdown completion with timeout.
+  ShutdownCoordinator* GetShutdownCoordinator() const {
+    return shutdown_coordinator_.get();
+  }
 
   const WorkerID &GetWorkerID() const;
 

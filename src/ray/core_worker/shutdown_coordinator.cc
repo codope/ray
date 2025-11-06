@@ -96,6 +96,8 @@ bool ShutdownCoordinator::TryTransitionToShutdown() {
     return false;
   }
   state_ = ShutdownState::kShutdown;
+  // Signal any threads waiting for shutdown completion
+  shutdown_complete_cv_.SignalAll();
   return true;
 }
 
@@ -124,6 +126,17 @@ bool ShutdownCoordinator::IsShuttingDown() const {
 
 bool ShutdownCoordinator::IsShutdown() const {
   return GetState() == ShutdownState::kShutdown;
+}
+
+void ShutdownCoordinator::WaitForShutdownComplete() const {
+  absl::MutexLock lock(&mu_);
+  // If already shutdown or still running (never initiated), return immediately
+  if (state_ == ShutdownState::kShutdown || state_ == ShutdownState::kRunning) {
+    return;
+  }
+  // Otherwise wait until state reaches kShutdown
+  mu_.Await(absl::Condition(
+      +[](ShutdownState *state) { return *state == ShutdownState::kShutdown; }, &state_));
 }
 
 std::string ShutdownCoordinator::GetStateString() const {

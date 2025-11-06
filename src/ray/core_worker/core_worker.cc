@@ -525,18 +525,36 @@ CoreWorker::CoreWorker(
   // in case there is a problem during construction.
   ConnectToRayletInternal();
 
-  // Initialize shutdown coordinator last - after all services are ready
+  // Note: Shutdown coordinator is initialized separately in InitializeShutdownCoordinator()
+  // after CoreWorker is wrapped in shared_ptr, so we can pass weak_ptr to executor.
+}  // NOLINT(readability/fn_size)
+
+void CoreWorker::InitializeShutdownCoordinator(std::weak_ptr<CoreWorker> self) {
+  // Initialize shutdown coordinator - must be called after construction with weak_ptr
   // Create concrete shutdown executor that implements real shutdown operations
-  auto shutdown_executor = std::make_unique<CoreWorkerShutdownExecutor>(this);
+  auto shutdown_executor = std::make_unique<CoreWorkerShutdownExecutor>(std::move(self));
   shutdown_coordinator_ = std::make_unique<ShutdownCoordinator>(
       std::move(shutdown_executor), options_.worker_type);
 
   RAY_LOG(DEBUG) << "Initialized unified shutdown coordinator with concrete executor for "
                     "worker type: "
                  << WorkerTypeString(options_.worker_type);
-}  // NOLINT(readability/fn_size)
+}
 
-CoreWorker::~CoreWorker() { RAY_LOG(INFO) << "Core worker is destructed"; }
+CoreWorker::~CoreWorker() {
+  // Wait for the shutdown sequence to complete before proceeding with destruction.
+  // This prevents use-after-free errors when shutdown callbacks are still executing
+  // while CoreWorker members are being destructed.
+  if (shutdown_coordinator_) {
+    if (!shutdown_coordinator_->IsShutdown()) {
+      RAY_LOG(WARNING)
+          << "CoreWorker destructor called before shutdown completed. Waiting for "
+             "shutdown sequence to finish. This may indicate improper shutdown ordering.";
+    }
+    shutdown_coordinator_->WaitForShutdownComplete();
+  }
+  RAY_LOG(INFO) << "Core worker is destructed";
+}
 
 void CoreWorker::Shutdown() {
   shutdown_coordinator_->RequestShutdown(

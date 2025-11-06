@@ -47,9 +47,9 @@ class CoreWorker;
 ///   idleness and only proceeds when idle; otherwise it is ignored.
 class CoreWorkerShutdownExecutor : public ShutdownExecutorInterface {
  public:
-  /// Constructor with CoreWorker reference for accessing internals
-  /// \param core_worker Reference to the CoreWorker instance
-  explicit CoreWorkerShutdownExecutor(CoreWorker *core_worker);
+  /// Constructor with CoreWorker weak pointer for safe lifetime management
+  /// \param core_worker Weak pointer to the CoreWorker instance
+  explicit CoreWorkerShutdownExecutor(std::weak_ptr<CoreWorker> core_worker);
 
   ~CoreWorkerShutdownExecutor() override = default;
 
@@ -85,8 +85,13 @@ class CoreWorkerShutdownExecutor : public ShutdownExecutorInterface {
   bool ShouldWorkerIdleExit() const override;
 
  private:
-  /// Reference to CoreWorker for accessing shutdown operations
-  CoreWorker *core_worker_;
+  /// Weak pointer to CoreWorker for safe lifetime management.
+  /// Using weak_ptr prevents keeping CoreWorker alive and allows
+  /// detecting if it's been destroyed during shutdown.
+  std::weak_ptr<CoreWorker> core_worker_;
+
+  /// Helper to lock weak_ptr and log if CoreWorker is gone
+  std::shared_ptr<CoreWorker> LockCoreWorker() const;
 
   void DisconnectServices(
       std::string_view exit_type,

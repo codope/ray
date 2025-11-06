@@ -196,6 +196,10 @@ class ShutdownCoordinator {
   /// \return true if in kShutdown state, false otherwise
   bool IsShutdown() const;
 
+  /// Wait for shutdown to complete. Blocks until state reaches kShutdown.
+  /// This is safe to call even if shutdown was never initiated.
+  void WaitForShutdownComplete() const;
+
   /// Get string representation of current state.
   ///
   /// \return Human-readable state description
@@ -262,6 +266,9 @@ class ShutdownCoordinator {
 
   /// Shutdown detail for observability (set once during shutdown initiation)
   std::string shutdown_detail_ ABSL_GUARDED_BY(mu_);
+
+  /// Condition variable for waiting on shutdown completion
+  mutable absl::CondVar shutdown_complete_cv_;
 };
 }  // namespace core
 }  // namespace ray

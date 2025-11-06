@@ -684,6 +684,10 @@ std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::CreateCoreWorker(
                                    pid,
                                    *task_by_state_gauge_,
                                    *actor_by_state_gauge_);
+
+  // Initialize shutdown coordinator after wrapping in shared_ptr so we can pass weak_ptr
+  core_worker->InitializeShutdownCoordinator(std::weak_ptr<CoreWorker>(core_worker));
+
   return core_worker;
 }
 
@@ -941,7 +945,31 @@ void CoreWorkerProcessImpl::RunWorkerTaskExecutionLoop() {
   auto core_worker = GetCoreWorker();
   RAY_CHECK(core_worker != nullptr);
   core_worker->RunTaskExecutionLoop();
-  RAY_LOG(INFO) << "Task execution loop terminated. Removing the global worker.";
+  RAY_LOG(INFO) << "Task execution loop terminated. Initiating explicit shutdown.";
+
+  // Explicit shutdown with timeout: wait for shutdown to complete or timeout
+  constexpr std::chrono::milliseconds kShutdownTimeout{30000};  // 30 seconds
+  auto start = std::chrono::steady_clock::now();
+
+  // Wait for shutdown to complete, with timeout
+  auto* coordinator = core_worker->GetShutdownCoordinator();
+  if (coordinator) {
+    while (!coordinator->IsShutdown()) {
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start);
+
+      if (elapsed >= kShutdownTimeout) {
+        RAY_LOG(WARNING) << "Shutdown timed out after " << elapsed.count()
+                         << "ms. Proceeding with destruction anyway.";
+        break;
+      }
+
+      // Brief sleep to avoid busy-waiting
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+
+  RAY_LOG(INFO) << "Shutdown complete. Removing the global worker.";
   {
     auto write_locked = core_worker_.LockForWrite();
     write_locked.Get().reset();
@@ -956,6 +984,30 @@ void CoreWorkerProcessImpl::ShutdownDriver() {
   global_worker->Disconnect(/*exit_type*/ rpc::WorkerExitType::INTENDED_USER_EXIT,
                             /*exit_detail*/ "Shutdown by ray.shutdown().");
   global_worker->Shutdown();
+
+  // Explicit shutdown with timeout: wait for shutdown to complete or timeout
+  constexpr std::chrono::milliseconds kShutdownTimeout{30000};  // 30 seconds
+  auto start = std::chrono::steady_clock::now();
+
+  // Wait for shutdown to complete, with timeout
+  auto* coordinator = global_worker->GetShutdownCoordinator();
+  if (coordinator) {
+    while (!coordinator->IsShutdown()) {
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start);
+
+      if (elapsed >= kShutdownTimeout) {
+        RAY_LOG(WARNING) << "Driver shutdown timed out after " << elapsed.count()
+                         << "ms. Proceeding with destruction anyway.";
+        break;
+      }
+
+      // Brief sleep to avoid busy-waiting
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+
+  RAY_LOG(INFO) << "Driver shutdown complete. Removing the global worker.";
   {
     auto write_locked = core_worker_.LockForWrite();
     write_locked.Get().reset();
