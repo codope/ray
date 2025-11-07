@@ -269,9 +269,6 @@ class CoreWorker : public std::enable_shared_from_this<CoreWorker> {
   bool IsConnected() const;
   bool SetDisconnectedIfConnected();
 
-  ray::core::ShutdownState GetShutdownState() const;
-  void SetShutdownState(ray::core::ShutdownState state);
-
   bool AreEventLoopsRunning() const { return event_loops_running_.load(); }
   void SetEventLoopsStopped() { event_loops_running_.store(false); }
 
@@ -1326,9 +1323,6 @@ class CoreWorker : public std::enable_shared_from_this<CoreWorker> {
   /// Return true if the core worker is in the exit process.
   bool IsExiting() const;
 
-  /// Mark this worker is exiting.
-  void SetIsExiting();
-
   /// Add task log info for a task when it starts executing.
   ///
   /// It's an no-op in local mode.
@@ -1980,10 +1974,6 @@ class CoreWorker : public std::enable_shared_from_this<CoreWorker> {
   // Shutdown synchronization primitives
   mutable absl::Mutex connected_mutex_;
   bool connected_ ABSL_GUARDED_BY(connected_mutex_) = true;
-
-  mutable absl::Mutex shutdown_state_mutex_;
-  ray::core::ShutdownState shutdown_state_ ABSL_GUARDED_BY(shutdown_state_mutex_) =
-      ray::core::ShutdownState::kRunning;
 
   std::atomic<bool> event_loops_running_{true};
   mutable absl::Mutex actor_callback_mutex_;

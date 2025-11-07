@@ -587,26 +587,6 @@ bool CoreWorker::SetDisconnectedIfConnected() {
   return true;
 }
 
-ray::core::ShutdownState CoreWorker::GetShutdownState() const {
-  absl::MutexLock lock(&shutdown_state_mutex_);
-  return shutdown_state_;
-}
-
-void CoreWorker::SetShutdownState(ray::core::ShutdownState state) {
-  absl::MutexLock lock(&shutdown_state_mutex_);
-
-  if (state <= shutdown_state_) {
-    RAY_LOG(WARNING) << "Ignoring backward/same shutdown state transition from "
-                     << static_cast<int>(shutdown_state_) << " to "
-                     << static_cast<int>(state);
-    return;
-  }
-
-  RAY_LOG(INFO) << "Shutdown state transition: " << static_cast<int>(shutdown_state_)
-                << " -> " << static_cast<int>(state);
-  shutdown_state_ = state;
-}
-
 std::function<void()> CoreWorker::GetActorShutdownCallback() const {
   absl::MutexLock lock(&actor_callback_mutex_);
   return actor_shutdown_callback_;
@@ -718,6 +698,11 @@ void CoreWorker::Exit(
     const rpc::WorkerExitType exit_type,
     const std::string &detail,
     const std::shared_ptr<LocalMemoryBuffer> &creation_task_exception_pb_bytes) {
+  if (!shutdown_coordinator_) {
+    RAY_LOG(DEBUG) << "Exit() called during CoreWorker destruction, ignoring";
+    return;
+  }
+
   // Preserve actor creation failure details by marking a distinct shutdown reason
   // when initialization raised an exception. An exception payload is provided.
   ShutdownReason reason = creation_task_exception_pb_bytes != nullptr
@@ -733,6 +718,11 @@ void CoreWorker::Exit(
 
 void CoreWorker::ForceExit(const rpc::WorkerExitType exit_type,
                            const std::string &detail) {
+  if (!shutdown_coordinator_) {
+    RAY_LOG(DEBUG) << "ForceExit() called during CoreWorker destruction, ignoring";
+    return;
+  }
+
   RAY_LOG(DEBUG) << "ForceExit called: exit_type=" << static_cast<int>(exit_type)
                  << ", detail=" << detail;
 
@@ -895,8 +885,8 @@ void CoreWorker::InternalHeartbeat() {
 }
 
 void CoreWorker::RecordMetrics() {
-  if (GetShutdownState() != ray::core::ShutdownState::kRunning) {
-    RAY_LOG(DEBUG) << "Skipping metrics recording during shutdown";
+  // Check for shutdown or destruction (periodical callbacks may execute during destruction)
+  if (!shutdown_coordinator_ || shutdown_coordinator_->ShouldEarlyExit()) {
     return;
   }
 
@@ -4367,6 +4357,10 @@ void CoreWorker::HandleExit(rpc::ExitRequest request,
           return;
         }
 
+        if (!shutdown_coordinator_) {
+          return;
+        }
+
         ShutdownReason reason;
         std::string detail;
 
@@ -4380,8 +4374,10 @@ void CoreWorker::HandleExit(rpc::ExitRequest request,
 
         shutdown_coordinator_->RequestShutdown(force_exit, reason, detail);
       },
-      // Fallback on RPC failure - still attempt shutdown
       [this]() {
+        if (!shutdown_coordinator_) {
+          return;
+        }
         shutdown_coordinator_->RequestShutdown(
             /*force_shutdown=*/false,
             ShutdownReason::kIdleTimeout,
@@ -4540,7 +4536,9 @@ rpc::JobConfig CoreWorker::GetJobConfig() const {
   return worker_context_->GetCurrentJobConfig();
 }
 
-bool CoreWorker::IsExiting() const { return shutdown_coordinator_->ShouldEarlyExit(); }
+bool CoreWorker::IsExiting() const {
+  return shutdown_coordinator_ && shutdown_coordinator_->ShouldEarlyExit();
+}
 
 bool CoreWorker::IsIdle(size_t num_objects_with_references,
                         int64_t pins_in_flight,

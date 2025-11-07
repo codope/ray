@@ -43,8 +43,6 @@ void CoreWorkerShutdownExecutor::ExecuteGracefulShutdown(
     return;
   }
 
-  core_worker->SetShutdownState(ShutdownState::kShuttingDown);
-
   if (core_worker->options_.worker_type == WorkerType::WORKER) {
     if (!core_worker->worker_context_->GetCurrentActorID().IsNil()) {
       auto callback = core_worker->GetActorShutdownCallback();
@@ -76,7 +74,6 @@ void CoreWorkerShutdownExecutor::ExecuteGracefulShutdown(
     }
   }
 
-  core_worker->SetShutdownState(ShutdownState::kDisconnecting);
   core_worker->core_worker_server_->Shutdown();
 
   // GCS client is safe to disconnect now that io_service has stopped.
@@ -88,7 +85,6 @@ void CoreWorkerShutdownExecutor::ExecuteGracefulShutdown(
     core_worker->gcs_client_.reset();
   }
 
-  core_worker->SetShutdownState(ShutdownState::kShutdown);
   RAY_LOG(INFO) << "Core worker ready to be deallocated.";
   core_worker->NotifyShutdownComplete();
 }
