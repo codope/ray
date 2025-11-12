@@ -1008,6 +1008,8 @@ void GcsActorManager::DestroyActor(const ActorID &actor_id,
     if (timer_it != graceful_shutdown_timers_.end()) {
       timer_it->second->cancel();
     }
+    // If switching to force kill, clear any preserved graceful death cause.
+    graceful_shutdown_death_causes_.erase(actor->GetWorkerID());
   }
 
   RAY_LOG(DEBUG) << "Try to kill actor " << actor->GetActorID() << ", with status "
@@ -1059,6 +1061,9 @@ void GcsActorManager::DestroyActor(const ActorID &actor_id,
                   << "Graceful shutdown timeout (" << graceful_shutdown_timeout_ms
                   << "ms) exceeded. Falling back to force kill.";
 
+              // Switching to force kill: do not use preserved graceful cause anymore.
+              self->graceful_shutdown_death_causes_.erase(worker_id);
+
               auto actor_iter = self->registered_actors_.find(actor_id);
               if (actor_iter != self->registered_actors_.end() &&
                   actor_iter->second->GetWorkerID() == worker_id) {
@@ -1068,6 +1073,8 @@ void GcsActorManager::DestroyActor(const ActorID &actor_id,
             });
 
         graceful_shutdown_timers_[worker_id] = std::move(timer);
+        // Preserve the intended graceful death cause to publish upon actual worker exit.
+        graceful_shutdown_death_causes_[worker_id] = death_cause;
       }
     } else {
       if (!worker_id.IsNil()) {
@@ -1079,65 +1086,95 @@ void GcsActorManager::DestroyActor(const ActorID &actor_id,
     }
   }
 
-  // Mark actor as DEAD to notify callers. For graceful shutdowns, created_actors_
-  // cleanup is deferred to allow timeout fallback, but we still update state for callers.
-  auto mutable_actor_table_data = actor->GetMutableActorTableData();
-  auto time = current_sys_time_ms();
-  if (actor->GetState() != rpc::ActorTableData::DEAD) {
-    actor->UpdateState(rpc::ActorTableData::DEAD);
-    mutable_actor_table_data->set_end_time(time);
-    mutable_actor_table_data->mutable_death_cause()->CopyFrom(death_cause);
-  } else if (mutable_actor_table_data->death_cause().context_case() ==
-                 ContextCase::kActorDiedErrorContext &&
-             death_cause.context_case() == ContextCase::kActorDiedErrorContext &&
-             mutable_actor_table_data->death_cause()
-                     .actor_died_error_context()
-                     .reason() == rpc::ActorDiedErrorContext::OUT_OF_SCOPE &&
-             death_cause.actor_died_error_context().reason() ==
-                 rpc::ActorDiedErrorContext::REF_DELETED) {
-    mutable_actor_table_data->mutable_death_cause()->CopyFrom(death_cause);
+  // Determine if we should defer publishing DEAD for graceful shutdowns.
+  bool defer_dead_publish = false;
+  {
+    const auto &worker_id = actor->GetWorkerID();
+    const bool has_graceful_timer =
+        graceful_shutdown_timers_.find(worker_id) != graceful_shutdown_timers_.end();
+    defer_dead_publish = (!force_kill && graceful_shutdown_timeout_ms > 0 && has_graceful_timer);
   }
-  mutable_actor_table_data->set_timestamp(time);
 
-  const bool is_restartable = IsActorRestartable(*mutable_actor_table_data);
-  if (!is_restartable) {
-    AddDestroyedActorToCache(it->second);
-    registered_actors_.erase(it);
-    function_manager_.RemoveJobReference(actor_id.JobId());
-    RemoveActorNameFromRegistry(actor);
-    if (!actor->IsDetached()) {
-      RemoveActorFromOwner(actor);
-    } else {
-      runtime_env_manager_.RemoveURIReference(actor_id.Hex());
+  if (!defer_dead_publish) {
+    // Mark actor as DEAD and publish immediately (non-graceful or force-kill paths).
+    auto mutable_actor_table_data = actor->GetMutableActorTableData();
+    auto time = current_sys_time_ms();
+    if (actor->GetState() != rpc::ActorTableData::DEAD) {
+      actor->UpdateState(rpc::ActorTableData::DEAD);
+      mutable_actor_table_data->set_end_time(time);
+      mutable_actor_table_data->mutable_death_cause()->CopyFrom(death_cause);
+    } else if (mutable_actor_table_data->death_cause().context_case() ==
+                   ContextCase::kActorDiedErrorContext &&
+               death_cause.context_case() == ContextCase::kActorDiedErrorContext &&
+               mutable_actor_table_data->death_cause()
+                       .actor_died_error_context()
+                       .reason() == rpc::ActorDiedErrorContext::OUT_OF_SCOPE &&
+               death_cause.actor_died_error_context().reason() ==
+                   rpc::ActorDiedErrorContext::REF_DELETED) {
+      mutable_actor_table_data->mutable_death_cause()->CopyFrom(death_cause);
     }
-  }
+    mutable_actor_table_data->set_timestamp(time);
 
-  auto actor_table_data =
-      std::make_shared<rpc::ActorTableData>(*mutable_actor_table_data);
-  // The backend storage is reliable in the future, so the status must be ok.
-  gcs_table_storage_->ActorTable().Put(
-      actor->GetActorID(),
-      *actor_table_data,
-      {[this,
-        actor,
-        actor_id,
-        actor_table_data,
-        is_restartable,
-        done_callback = std::move(done_callback)](Status status) {
-         if (done_callback) {
-           done_callback();
-         }
-         gcs_publisher_->PublishActor(actor_id,
-                                      GenActorDataOnlyWithStates(*actor_table_data));
-         if (!is_restartable) {
-           gcs_table_storage_->ActorTaskSpecTable().Delete(actor_id,
-                                                           {[](auto) {}, io_context_});
-         }
-         actor->WriteActorExportEvent(false);
-         // Destroy placement group owned by this actor.
-         destroy_owned_placement_group_if_needed_(actor_id);
-       },
-       io_context_});
+    const bool is_restartable = IsActorRestartable(*mutable_actor_table_data);
+    if (!is_restartable) {
+      AddDestroyedActorToCache(it->second);
+      registered_actors_.erase(it);
+      function_manager_.RemoveJobReference(actor_id.JobId());
+      RemoveActorNameFromRegistry(actor);
+      if (!actor->IsDetached()) {
+        RemoveActorFromOwner(actor);
+      } else {
+        runtime_env_manager_.RemoveURIReference(actor_id.Hex());
+      }
+    }
+
+    auto actor_table_data =
+        std::make_shared<rpc::ActorTableData>(*mutable_actor_table_data);
+    // The backend storage is reliable in the future, so the status must be ok.
+    gcs_table_storage_->ActorTable().Put(
+        actor->GetActorID(),
+        *actor_table_data,
+        {[this,
+          actor,
+          actor_id,
+          actor_table_data,
+          is_restartable,
+          done_callback = std::move(done_callback)](Status status) {
+           if (done_callback) {
+             done_callback();
+           }
+           gcs_publisher_->PublishActor(actor_id,
+                                        GenActorDataOnlyWithStates(*actor_table_data));
+           if (!is_restartable) {
+             gcs_table_storage_->ActorTaskSpecTable().Delete(actor_id,
+                                                             {[](auto) {}, io_context_});
+           }
+           actor->WriteActorExportEvent(false);
+           // Destroy placement group owned by this actor.
+           destroy_owned_placement_group_if_needed_(actor_id);
+         },
+         io_context_});
+  } else {
+    // Graceful path: update in-memory state to DEAD so internal state reflects shutdown,
+    // but defer storage update and publication until worker actually exits.
+    auto mutable_actor_table_data = actor->GetMutableActorTableData();
+    auto time = current_sys_time_ms();
+    if (actor->GetState() != rpc::ActorTableData::DEAD) {
+      actor->UpdateState(rpc::ActorTableData::DEAD);
+      mutable_actor_table_data->set_end_time(time);
+      mutable_actor_table_data->mutable_death_cause()->CopyFrom(death_cause);
+    } else if (mutable_actor_table_data->death_cause().context_case() ==
+                   ContextCase::kActorDiedErrorContext &&
+               death_cause.context_case() == ContextCase::kActorDiedErrorContext &&
+               mutable_actor_table_data->death_cause()
+                       .actor_died_error_context()
+                       .reason() == rpc::ActorDiedErrorContext::OUT_OF_SCOPE &&
+               death_cause.actor_died_error_context().reason() ==
+                   rpc::ActorDiedErrorContext::REF_DELETED) {
+      mutable_actor_table_data->mutable_death_cause()->CopyFrom(death_cause);
+    }
+    mutable_actor_table_data->set_timestamp(time);
+  }
 
   // Inform all creation callbacks that the actor was cancelled, not created.
   RunAndClearActorCreationCallbacks(
@@ -1262,10 +1299,14 @@ void GcsActorManager::OnWorkerDead(const ray::NodeID &node_id,
   }
 
   rpc::ActorDeathCause death_cause;
-  if (creation_task_exception != nullptr) {
+  // If this worker was undergoing a graceful shutdown, prefer the preserved death cause.
+  auto preserved_it = graceful_shutdown_death_causes_.find(worker_id);
+  if (preserved_it != graceful_shutdown_death_causes_.end()) {
+    death_cause = preserved_it->second;
+    graceful_shutdown_death_causes_.erase(preserved_it);
+  } else if (creation_task_exception != nullptr) {
     absl::StrAppend(
         &message, ": ", creation_task_exception->formatted_exception_string());
-
     death_cause.mutable_creation_task_failure_context()->CopyFrom(
         *creation_task_exception);
   } else {
@@ -1458,7 +1499,10 @@ void GcsActorManager::RestartActor(const ActorID &actor_id,
   auto timer_it = graceful_shutdown_timers_.find(worker_id);
   if (timer_it != graceful_shutdown_timers_.end()) {
     timer_it->second->cancel();
+    graceful_shutdown_timers_.erase(timer_it);
   }
+  // Clear any preserved graceful death cause from previous instance.
+  graceful_shutdown_death_causes_.erase(worker_id);
 
   auto mutable_actor_table_data = actor->GetMutableActorTableData();
   // If the need_reschedule is set to false, then set the `remaining_restarts` to 0

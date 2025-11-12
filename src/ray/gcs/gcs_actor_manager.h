@@ -524,6 +524,11 @@ class GcsActorManager : public rpc::ActorInfoGcsServiceHandler,
   absl::flat_hash_map<WorkerID, std::unique_ptr<boost::asio::deadline_timer>>
       graceful_shutdown_timers_;
 
+  /// Preserved death causes for actors undergoing graceful shutdown, keyed by WorkerID.
+  /// Used to defer DEAD publication until actual worker exit and to provide accurate
+  /// death causes upon OnWorkerDead.
+  absl::flat_hash_map<WorkerID, rpc::ActorDeathCause> graceful_shutdown_death_causes_;
+
   // Debug info.
   enum CountType {
     REGISTER_ACTOR_REQUEST = 0,
