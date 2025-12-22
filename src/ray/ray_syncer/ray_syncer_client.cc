@@ -14,6 +14,8 @@
 
 #include "ray/ray_syncer/ray_syncer_client.h"
 
+#include <chrono>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <utility>
@@ -21,6 +23,25 @@
 #include "ray/rpc/authentication/authentication_token_loader.h"
 
 namespace ray::syncer {
+
+// #region agent log
+inline void DebugLogClient(const std::string &location,
+                           const std::string &message,
+                           const std::string &hypothesis_id,
+                           const std::string &data = "") {
+  static const char *log_path = "/Users/sagar/workspace/codope/ray/.cursor/debug.log";
+  auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::system_clock::now().time_since_epoch())
+                 .count();
+  std::ofstream f(log_path, std::ios::app);
+  if (f.is_open()) {
+    f << "{\"location\":\"" << location << "\",\"message\":\"" << message
+      << "\",\"hypothesisId\":\"" << hypothesis_id << "\",\"data\":{" << data
+      << "},\"timestamp\":" << now << ",\"sessionId\":\"debug-session\"}\n";
+    f.close();
+  }
+}
+// #endregion
 
 RayClientBidiReactor::RayClientBidiReactor(
     const std::string &remote_node_id,
@@ -54,8 +75,24 @@ RayClientBidiReactor::RayClientBidiReactor(
 }
 
 void RayClientBidiReactor::OnDone(const grpc::Status &status) {
+  // #region agent log
+  DebugLogClient("ray_syncer_client.cc:OnDone",
+                 "done",
+                 "B",
+                 "\"this\":\"" + std::to_string(reinterpret_cast<uintptr_t>(this)) +
+                     "\",\"status_ok\":\"" + (status.ok() ? "true" : "false") +
+                     "\",\"status_msg\":\"" + status.error_message() + "\"");
+  // #endregion
   io_context_.dispatch(
       [this, status]() {
+        // #region agent log
+        DebugLogClient("ray_syncer_client.cc:OnDone:dispatch",
+                       "cleanup_executing",
+                       "B,E",
+                       "\"this\":\"" + std::to_string(reinterpret_cast<uintptr_t>(this)) +
+                           "\",\"status_ok\":\"" + (status.ok() ? "true" : "false") +
+                           "\"");
+        // #endregion
         cleanup_cb_(this, !status.ok());
         self_ref_.reset();
       },
@@ -63,6 +100,13 @@ void RayClientBidiReactor::OnDone(const grpc::Status &status) {
 }
 
 void RayClientBidiReactor::DoDisconnect() {
+  // #region agent log
+  DebugLogClient(
+      "ray_syncer_client.cc:DoDisconnect",
+      "disconnect",
+      "B,D",
+      "\"this\":\"" + std::to_string(reinterpret_cast<uintptr_t>(this)) + "\"");
+  // #endregion
   io_context_.dispatch(
       [this]() {
         StartWritesDone();

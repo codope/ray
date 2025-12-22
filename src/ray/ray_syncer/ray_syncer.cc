@@ -14,6 +14,8 @@
 
 #include "ray/ray_syncer/ray_syncer.h"
 
+#include <chrono>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <string>
@@ -27,6 +29,25 @@
 #include "ray/ray_syncer/ray_syncer_server.h"
 
 namespace ray::syncer {
+
+// #region agent log
+inline void DebugLogSyncerMain(const std::string &location,
+                               const std::string &message,
+                               const std::string &hypothesis_id,
+                               const std::string &data = "") {
+  static const char *log_path = "/Users/sagar/workspace/codope/ray/.cursor/debug.log";
+  auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::system_clock::now().time_since_epoch())
+                 .count();
+  std::ofstream f(log_path, std::ios::app);
+  if (f.is_open()) {
+    f << "{\"location\":\"" << location << "\",\"message\":\"" << message
+      << "\",\"hypothesisId\":\"" << hypothesis_id << "\",\"data\":{" << data
+      << "},\"timestamp\":" << now << ",\"sessionId\":\"debug-session\"}\n";
+    f.close();
+  }
+}
+// #endregion
 
 RaySyncer::RaySyncer(instrumented_io_context &io_context,
                      const std::string &local_node_id,
@@ -80,6 +101,12 @@ std::vector<std::string> RaySyncer::GetAllConnectedNodeIDs() const {
 
 void RaySyncer::Connect(const std::string &node_id,
                         std::shared_ptr<grpc::Channel> channel) {
+  // #region agent log
+  DebugLogSyncerMain("ray_syncer.cc:Connect:channel",
+                     "client_connect_start",
+                     "C",
+                     "\"node_id\":\"" + NodeID::FromBinary(node_id).Hex() + "\"");
+  // #endregion
   boost::asio::dispatch(
       io_context_.get_executor(), std::packaged_task<void()>([=]() {
         auto stub = ray::rpc::syncer::RaySyncer::NewStub(channel);
@@ -92,6 +119,17 @@ void RaySyncer::Connect(const std::string &node_id,
             /* cleanup_cb */
             [this, channel](RaySyncerBidiReactor *bidi_reactor, bool restart) {
               const std::string &remote_node_id = bidi_reactor->GetRemoteNodeID();
+              // #region agent log
+              DebugLogSyncerMain(
+                  "ray_syncer.cc:Connect:cleanup_cb",
+                  "client_cleanup",
+                  "E",
+                  "\"reactor\":\"" +
+                      std::to_string(reinterpret_cast<uintptr_t>(bidi_reactor)) +
+                      "\",\"remote_node_id\":\"" +
+                      NodeID::FromBinary(remote_node_id).Hex() + "\",\"restart\":\"" +
+                      (restart ? "true" : "false") + "\"");
+              // #endregion
               auto iter = sync_reactors_.find(remote_node_id);
               if (iter != sync_reactors_.end()) {
                 if (iter->second.get() != bidi_reactor) {
@@ -116,6 +154,14 @@ void RaySyncer::Connect(const std::string &node_id,
             /* stub */ std::move(stub),
             /* max_batch_size */ max_batch_size_,
             /* max_batch_delay_ms */ max_batch_delay_ms_);
+        // #region agent log
+        DebugLogSyncerMain(
+            "ray_syncer.cc:Connect:before_SetSelfRef",
+            "set_self_ref",
+            "C",
+            "\"reactor\":\"" +
+                std::to_string(reinterpret_cast<uintptr_t>(reactor.get())) + "\"");
+        // #endregion
         reactor->SetSelfRef(reactor);
         Connect(reactor);
         reactor->StartCall();
@@ -224,6 +270,13 @@ void RaySyncer::BroadcastMessage(std::shared_ptr<const RaySyncMessage> message) 
 }
 
 ServerBidiReactor *RaySyncerService::StartSync(grpc::CallbackServerContext *context) {
+  // #region agent log
+  DebugLogSyncerMain(
+      "ray_syncer.cc:StartSync",
+      "server_start_sync",
+      "D",
+      "\"local_node_id\":\"" + NodeID::FromBinary(syncer_.GetLocalNodeID()).Hex() + "\"");
+  // #endregion
   auto reactor = std::make_shared<RayServerBidiReactor>(
       context,
       syncer_.GetIOContext(),
@@ -235,6 +288,14 @@ ServerBidiReactor *RaySyncerService::StartSync(grpc::CallbackServerContext *cont
         // No need to reconnect for server side.
         RAY_CHECK(!reconnect);
         const auto &node_id = bidi_reactor->GetRemoteNodeID();
+        // #region agent log
+        DebugLogSyncerMain(
+            "ray_syncer.cc:StartSync:cleanup_cb",
+            "server_cleanup",
+            "E",
+            "\"reactor\":\"" + std::to_string(reinterpret_cast<uintptr_t>(bidi_reactor)) +
+                "\",\"node_id\":\"" + NodeID::FromBinary(node_id).Hex() + "\"");
+        // #endregion
         auto iter = syncer_.sync_reactors_.find(node_id);
         if (iter != syncer_.sync_reactors_.end()) {
           if (iter->second.get() != bidi_reactor) {
@@ -259,6 +320,15 @@ ServerBidiReactor *RaySyncerService::StartSync(grpc::CallbackServerContext *cont
   RAY_LOG(DEBUG).WithField(NodeID::FromBinary(reactor->GetRemoteNodeID()))
       << "Get connection";
 
+  // #region agent log
+  DebugLogSyncerMain("ray_syncer.cc:StartSync:before_SetSelfRef",
+                     "server_set_self_ref",
+                     "C",
+                     "\"reactor\":\"" +
+                         std::to_string(reinterpret_cast<uintptr_t>(reactor.get())) +
+                         "\",\"remote_node_id\":\"" +
+                         NodeID::FromBinary(reactor->GetRemoteNodeID()).Hex() + "\"");
+  // #endregion
   reactor->SetSelfRef(reactor);
 
   // If the reactor has already called Finish() (e.g., due to authentication failure),

@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <chrono>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <string>
@@ -26,6 +28,25 @@
 #include "src/ray/protobuf/ray_syncer.grpc.pb.h"
 
 namespace ray::syncer {
+
+// #region agent log
+inline void DebugLogSyncer(const std::string &location,
+                           const std::string &message,
+                           const std::string &hypothesis_id,
+                           const std::string &data = "") {
+  static const char *log_path = "/Users/sagar/workspace/codope/ray/.cursor/debug.log";
+  auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::system_clock::now().time_since_epoch())
+                 .count();
+  std::ofstream f(log_path, std::ios::app);
+  if (f.is_open()) {
+    f << "{\"location\":\"" << location << "\",\"message\":\"" << message
+      << "\",\"hypothesisId\":\"" << hypothesis_id << "\",\"data\":{" << data
+      << "},\"timestamp\":" << now << ",\"sessionId\":\"debug-session\"}\n";
+    f.close();
+  }
+}
+// #endregion
 
 /// This class implements the communication between two nodes except the initialization
 /// and cleanup.
@@ -55,7 +76,16 @@ class RaySyncerBidiReactorBase : public RaySyncerBidiReactor, public T {
         max_batch_size_(max_batch_size),
         max_batch_delay_ms_(std::chrono::milliseconds(max_batch_delay_ms)),
         batch_timer_(io_context),
-        batch_timer_active_(false) {}
+        batch_timer_active_(false) {
+    // #region agent log
+    DebugLogSyncer("ray_syncer_bidi_reactor_base.h:ctor",
+                   "reactor_created",
+                   "C",
+                   "\"this\":\"" + std::to_string(reinterpret_cast<uintptr_t>(this)) +
+                       "\",\"remote_node_id\":\"" +
+                       NodeID::FromBinary(GetRemoteNodeID()).Hex() + "\"");
+    // #endregion
+  }
 
   bool PushToSendingQueue(std::shared_ptr<const RaySyncMessage> message) override {
     if (*IsDisconnected()) {
@@ -100,8 +130,26 @@ class RaySyncerBidiReactorBase : public RaySyncerBidiReactor, public T {
         batch_timer_.expires_after(max_batch_delay_ms_);
         // Use weak_ptr to avoid use-after-free when the reactor is destroyed.
         auto weak_self = std::weak_ptr<RaySyncerBidiReactor>(self_ref_);
+        // #region agent log
+        DebugLogSyncer("ray_syncer_bidi_reactor_base.h:batch_timer_schedule",
+                       "timer_scheduled",
+                       "A,C",
+                       "\"this\":\"" + std::to_string(reinterpret_cast<uintptr_t>(this)) +
+                           "\",\"self_ref_valid\":\"" + (self_ref_ ? "true" : "false") +
+                           "\",\"weak_self_expired\":\"" +
+                           (weak_self.expired() ? "true" : "false") + "\"");
+        // #endregion
         batch_timer_.async_wait([weak_self, this](const boost::system::error_code &ec) {
+          // #region agent log
           auto self = weak_self.lock();
+          DebugLogSyncer("ray_syncer_bidi_reactor_base.h:batch_timer_callback",
+                         "timer_fired",
+                         "A",
+                         "\"this\":\"" +
+                             std::to_string(reinterpret_cast<uintptr_t>(this)) +
+                             "\",\"lock_succeeded\":\"" + (self ? "true" : "false") +
+                             "\",\"ec\":\"" + ec.message() + "\"");
+          // #endregion
           if (!self) {
             return;
           }
@@ -118,6 +166,14 @@ class RaySyncerBidiReactorBase : public RaySyncerBidiReactor, public T {
   }
 
   virtual ~RaySyncerBidiReactorBase() {
+    // #region agent log
+    DebugLogSyncer("ray_syncer_bidi_reactor_base.h:dtor",
+                   "reactor_destroyed",
+                   "B",
+                   "\"this\":\"" + std::to_string(reinterpret_cast<uintptr_t>(this)) +
+                       "\",\"batch_timer_active\":\"" +
+                       (batch_timer_active_ ? "true" : "false") + "\"");
+    // #endregion
     if (batch_timer_active_) {
       batch_timer_.cancel();
     }
@@ -214,6 +270,13 @@ class RaySyncerBidiReactorBase : public RaySyncerBidiReactor, public T {
   using T::StartWrite;
 
   void OnWriteDone(bool ok) override {
+    // #region agent log
+    DebugLogSyncer("ray_syncer_bidi_reactor_base.h:OnWriteDone",
+                   "write_done",
+                   "B",
+                   "\"this\":\"" + std::to_string(reinterpret_cast<uintptr_t>(this)) +
+                       "\",\"ok\":\"" + (ok ? "true" : "false") + "\"");
+    // #endregion
     io_context_.dispatch(
         [this, disconnected = IsDisconnected(), ok]() {
           if (*disconnected) {
@@ -231,6 +294,15 @@ class RaySyncerBidiReactorBase : public RaySyncerBidiReactor, public T {
   }
 
   void OnReadDone(bool ok) override {
+    // #region agent log
+    DebugLogSyncer("ray_syncer_bidi_reactor_base.h:OnReadDone",
+                   "read_done",
+                   "B",
+                   "\"this\":\"" + std::to_string(reinterpret_cast<uintptr_t>(this)) +
+                       "\",\"ok\":\"" + (ok ? "true" : "false") +
+                       "\",\"msg_batch_valid\":\"" +
+                       (receiving_message_batch_ ? "true" : "false") + "\"");
+    // #endregion
     io_context_.dispatch(
         [this, ok, msg_batch = std::move(receiving_message_batch_)]() mutable {
           // NOTE: According to the grpc callback streaming api best practices 3.)
