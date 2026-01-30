@@ -1,5 +1,6 @@
 """A utility for debugging serialization issues."""
 import inspect
+import json
 from contextlib import contextmanager
 from typing import Any, Optional, Set, Tuple
 
@@ -9,6 +10,34 @@ import colorama
 import ray  # noqa: F401
 import ray.cloudpickle as cp
 from ray.util.annotations import DeveloperAPI
+
+# #region agent log
+_DEBUG_LOG_PATH = "/Users/sagar/workspace/codope/ray/.cursor/debug.log"
+
+
+def _debug_log(hypothesisId, location, message, data=None):
+    import time
+
+    try:
+        with open(_DEBUG_LOG_PATH, "a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "hypothesisId": hypothesisId,
+                        "location": location,
+                        "message": message,
+                        "data": data,
+                        "timestamp": time.time(),
+                        "sessionId": "debug-session",
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+
+
+# #endregion
 
 
 @contextmanager
@@ -105,6 +134,18 @@ def _inspect_generic_serialization(base_obj, depth, parent, failure_set, printer
     """Adds the first-found non-serializable element to the failure_set."""
     assert not inspect.isfunction(base_obj)
     functions = inspect.getmembers(base_obj, predicate=inspect.isfunction)
+    # #region agent log
+    _debug_log(
+        "A",
+        "check_serialize.py:_inspect_generic_serialization",
+        "functions from getmembers",
+        {
+            "base_obj_type": str(type(base_obj)),
+            "depth": depth,
+            "functions": [(n, str(type(o))) for n, o in functions],
+        },
+    )
+    # #endregion
     found = False
     with printer.indent():
         for name, obj in functions:
@@ -122,9 +163,31 @@ def _inspect_generic_serialization(base_obj, depth, parent, failure_set, printer
 
     with printer.indent():
         members = inspect.getmembers(base_obj)
+        # #region agent log
+        _debug_log(
+            "B",
+            "check_serialize.py:_inspect_generic_serialization",
+            "all members before filter",
+            {
+                "base_obj_type": str(type(base_obj)),
+                "members_count": len(members),
+                "members": [
+                    (n, str(type(o)), inspect.isbuiltin(o)) for n, o in members[:20]
+                ],
+            },
+        )
+        # #endregion
         for name, obj in members:
             if name.startswith("__") and name.endswith("__") or inspect.isbuiltin(obj):
                 continue
+            # #region agent log
+            _debug_log(
+                "B",
+                "check_serialize.py:_inspect_generic_serialization",
+                "member NOT filtered out",
+                {"name": name, "obj_type": str(type(obj)), "depth": depth},
+            )
+            # #endregion
             serializable, _ = _inspect_serializability(
                 obj,
                 name=name,
@@ -199,6 +262,18 @@ def _inspect_serializability(
         found = True
         try:
             if depth == 0:
+                # #region agent log
+                _debug_log(
+                    "D",
+                    "check_serialize.py:_inspect_serializability",
+                    "adding FailureTuple at depth=0",
+                    {
+                        "name": name,
+                        "obj_type": str(type(base_obj)),
+                        "parent_type": str(type(parent)) if parent else None,
+                    },
+                )
+                # #endregion
                 failure_set.add(FailureTuple(base_obj, name, parent))
         # Some objects may not be hashable, so we skip adding this to the set.
         except Exception:
@@ -227,7 +302,32 @@ def _inspect_serializability(
             printer=printer,
         )
 
+    # #region agent log
+    _debug_log(
+        "E",
+        "check_serialize.py:_inspect_serializability",
+        "before fallback add",
+        {
+            "failure_set_len": len(failure_set),
+            "failure_set_contents": [
+                {"name": ft.name, "obj_type": str(type(ft.obj)), "obj_id": id(ft.obj)}
+                for ft in failure_set
+            ],
+            "top_level": top_level,
+            "base_obj_type": str(type(base_obj)),
+            "base_obj_id": id(base_obj),
+        },
+    )
+    # #endregion
     if not failure_set:
+        # #region agent log
+        _debug_log(
+            "E",
+            "check_serialize.py:_inspect_serializability",
+            "adding fallback FailureTuple",
+            {"name": name, "obj_type": str(type(base_obj)), "obj_id": id(base_obj)},
+        )
+        # #endregion
         failure_set.add(FailureTuple(base_obj, name, parent))
 
     if top_level:

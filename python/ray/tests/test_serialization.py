@@ -321,11 +321,45 @@ def test_numpy_subclass_serialization_pickle(ray_start_regular):
 
 
 def test_inspect_serialization(enable_pickle_debug):
+    import json
     import threading
+    import time
 
     from ray.cloudpickle import dumps_debug
 
+    # #region agent log
+    _DEBUG_LOG_PATH = "/Users/sagar/workspace/codope/ray/.cursor/debug.log"
+
+    def _debug_log(hypothesisId, location, message, data=None):
+        try:
+            with open(_DEBUG_LOG_PATH, "a") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "hypothesisId": hypothesisId,
+                            "location": location,
+                            "message": message,
+                            "data": data,
+                            "timestamp": time.time(),
+                            "sessionId": "debug-session",
+                        }
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+
+    # #endregion
+
     lock = threading.Lock()
+    # #region agent log
+    _debug_log(
+        "C",
+        "test_serialization.py:test_inspect_serialization",
+        "lock created",
+        {"lock_id": id(lock), "lock_type": str(type(lock))},
+    )
+    # #endregion
 
     with pytest.raises(TypeError):
         dumps_debug(lock)
@@ -343,12 +377,75 @@ def test_inspect_serialization(enable_pickle_debug):
     from ray.util.check_serialize import inspect_serializability
 
     results = inspect_serializability(lock)
+    # #region agent log
+    failure_list = list(results[1])
+    _debug_log(
+        "C",
+        "test_serialization.py:test_inspect_serialization",
+        "inspect_serializability(lock) results",
+        {
+            "failure_set_len": len(results[1]),
+            "failure_list": [
+                {
+                    "name": ft.name,
+                    "obj_type": str(type(ft.obj)),
+                    "obj_id": id(ft.obj),
+                    "obj_is_lock": ft.obj is lock,
+                }
+                for ft in failure_list
+            ],
+            "lock_id": id(lock),
+        },
+    )
+    # #endregion
     assert list(results[1])[0].obj == lock, results
 
     results = inspect_serializability(test_func)
+    # #region agent log
+    failure_list = list(results[1])
+    _debug_log(
+        "C",
+        "test_serialization.py:test_inspect_serialization",
+        "inspect_serializability(test_func) results",
+        {
+            "failure_set_len": len(results[1]),
+            "failure_list": [
+                {
+                    "name": ft.name,
+                    "obj_type": str(type(ft.obj)),
+                    "obj_id": id(ft.obj),
+                    "obj_is_lock": ft.obj is lock,
+                }
+                for ft in failure_list
+            ],
+            "lock_id": id(lock),
+        },
+    )
+    # #endregion
     assert list(results[1])[0].obj == lock, results
 
     results = inspect_serializability(test_class)
+    # #region agent log
+    failure_list = list(results[1])
+    _debug_log(
+        "C",
+        "test_serialization.py:test_inspect_serialization",
+        "inspect_serializability(test_class) results",
+        {
+            "failure_set_len": len(results[1]),
+            "failure_list": [
+                {
+                    "name": ft.name,
+                    "obj_type": str(type(ft.obj)),
+                    "obj_id": id(ft.obj),
+                    "obj_is_lock": ft.obj is lock,
+                }
+                for ft in failure_list
+            ],
+            "lock_id": id(lock),
+        },
+    )
+    # #endregion
     assert list(results[1])[0].obj == lock, results
 
 
