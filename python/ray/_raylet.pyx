@@ -1018,12 +1018,43 @@ cdef store_task_errors(
     for _ in range(returns[0].size()):
         errors.append(failure_object)
 
+    # #region agent log
+    import json as _json
+    _log_entry = _json.dumps({
+        "location": "_raylet.pyx:store_task_errors",
+        "message": "store_task_errors called, sleeping 2s to widen window",
+        "data": {"num_errors": len(errors),
+                 "exc_type": type(exc).__name__},
+        "timestamp": int(time.time() * 1000),
+        "hypothesisId": "B"})
+    try:
+        with open("/Users/sagar/workspace/codope/ray/.cursor/debug.log", "a") as _f:
+            _f.write(_log_entry + "\n")
+    except Exception:
+        pass
+    time.sleep(2)
+    # #endregion
+
     num_errors_stored = core_worker.store_task_outputs(
         worker, errors,
         caller_address,
         returns,
         None,  # ref_generator_id
         c_tensor_transport)
+
+    # #region agent log
+    _log_entry = _json.dumps({
+        "location": "_raylet.pyx:store_task_errors:after_store",
+        "message": "store_task_outputs completed",
+        "data": {"num_errors_stored": num_errors_stored},
+        "timestamp": int(time.time() * 1000),
+        "hypothesisId": "B"})
+    try:
+        with open("/Users/sagar/workspace/codope/ray/.cursor/debug.log", "a") as _f:
+            _f.write(_log_entry + "\n")
+    except Exception:
+        pass
+    # #endregion
 
     if (<int>task_type == <int>TASK_TYPE_ACTOR_CREATION_TASK):
         raise ActorDiedError.from_task_error(failure_object)
@@ -2181,6 +2212,16 @@ cdef execute_task_with_cancellation_handler(
     except KeyboardInterrupt as e:
         # Catch and handle task cancellation, which will result in an interrupt being
         # raised.
+        #
+        # Immediately clear current_task_id to prevent further cancellation
+        # interrupts from arriving during error storage. kill_main_task
+        # checks current_task_id under the lock before sending
+        # _thread.interrupt_main(). Without this, a second ray.cancel()
+        # could interrupt store_task_errors, causing a KeyboardInterrupt to
+        # escape task_execution_handler entirely.
+        with current_task_id_lock:
+            current_task_id = None
+
         e = TaskCancelledError(
             core_worker.get_current_task_id()).with_traceback(e.__traceback__)
 
@@ -2376,6 +2417,27 @@ cdef CRayStatus task_execution_handler(
             msg = "Unexpected exception raised in task execution handler: {}".format(e)
             logger.error(msg)
             return CRayStatus.UnexpectedSystemExit(msg)
+        # #region agent log
+        except BaseException as e:
+            import json as _json
+            _log_entry = _json.dumps({
+                "location": "_raylet.pyx:task_execution_handler",
+                "message": "BaseException escaped all handlers",
+                "data": {"exception_type": type(e).__name__,
+                         "exception_str": str(e)[:200],
+                         "returns_size": returns[0].size() if returns != NULL else -1},
+                "timestamp": int(time.time() * 1000),
+                "hypothesisId": "A"})
+            try:
+                with open("/Users/sagar/workspace/codope/ray/.cursor/debug.log", "a") as _f:
+                    _f.write(_log_entry + "\n")
+            except Exception:
+                pass
+            msg = ("BaseException escaped task execution handlers: "
+                   f"{type(e).__name__}: {e}")
+            logger.error(msg)
+            return CRayStatus.UnexpectedSystemExit(msg)
+        # #endregion
 
     return CRayStatus.OK()
 
@@ -2383,6 +2445,23 @@ cdef c_bool kill_main_task(const CTaskID &task_id) nogil:
     with gil:
         task_id_to_kill = TaskID(task_id.Binary())
         with current_task_id_lock:
+            # #region agent log
+            import json as _json
+            _will_interrupt = (current_task_id == task_id_to_kill)
+            _log_entry = _json.dumps({
+                "location": "_raylet.pyx:kill_main_task",
+                "message": "kill_main_task called",
+                "data": {"current_task_id": str(current_task_id),
+                         "task_id_to_kill": str(task_id_to_kill),
+                         "will_send_interrupt": _will_interrupt},
+                "timestamp": int(time.time() * 1000),
+                "hypothesisId": "C"})
+            try:
+                with open("/Users/sagar/workspace/codope/ray/.cursor/debug.log", "a") as _f:
+                    _f.write(_log_entry + "\n")
+            except Exception:
+                pass
+            # #endregion
             if current_task_id != task_id_to_kill:
                 return False
             _thread.interrupt_main()
