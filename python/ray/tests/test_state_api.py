@@ -3784,13 +3784,15 @@ def test_raise_on_missing_output_partial_failures(monkeypatch, ray_start_cluster
     """
     monkeypatch.setenv("RAY_record_ref_creation_sites", "1")
     cluster = ray_start_cluster
-    cluster.add_node(num_cpus=2)
+    # Use dashboard_port=0 to auto-select a free port and avoid conflicts with previous tests
+    cluster.add_node(num_cpus=2, dashboard_port=0)
     ray.init(address=cluster.address)
     with monkeypatch.context() as m:
         # defer for 10s for the second node.
+        delay_env = "NodeManagerService.grpc_server.GetObjectsInfo=10000000:10000000"
         m.setenv(
             "RAY_testing_asio_delay_us",
-            "NodeManagerService.grpc_server.GetObjectsInfo=10000000:10000000",
+            delay_env,
         )
         cluster.add_node(num_cpus=2)
 

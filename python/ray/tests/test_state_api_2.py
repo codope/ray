@@ -387,15 +387,21 @@ def test_ray_timeline(shutdown_only):
 
     ray.get(f.remote())
 
+    # Wait for aggregator agent to be ready if in aggregator mode
+    wait_for_aggregator_agent_if_enabled()
+
     with tempfile.TemporaryDirectory() as tmpdirname:
         filename = os.path.join(tmpdirname, "timeline.json")
-        ray.timeline(filename)
 
-        with open(filename, "r") as f:
-            dumped = json.load(f)
-        # TODO(swang): Check actual content. It doesn't seem to match the
-        # return value of chrome_tracing_dump in above tests?
-        assert len(dumped) > 0
+        def check_timeline_has_data():
+            ray.timeline(filename)
+            with open(filename, "r") as f:
+                dumped = json.load(f)
+            # In aggregator mode, events may take longer to propagate to GCS
+            return len(dumped) > 0
+
+        # Use wait_for_condition to handle timing variations in aggregator mode
+        wait_for_condition(check_timeline_has_data, timeout=30, retry_interval_ms=1000)
 
 
 def test_state_init_multiple_threads(shutdown_only):
