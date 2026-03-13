@@ -603,6 +603,64 @@ The core pool creates actors with static `actor_options` baked in at `ActorPool.
 
 Three dedicated parity tests (`test_actor_pool_map_operator.py:1542-1620`) run the same workload through both the legacy and core paths and compare results: `test_actor_pool_map_operator_parity` (correctness), `test_actor_pool_scaling_parity` (scale up/down behavior), and `test_actor_pool_stats_parity` (stats reporting). They use `monkeypatch` to toggle `use_core_actor_pool` and assert output equivalence.
 
+### Public API Design (`ray.experimental.actor_pool`)
+
+**Q: How does this relate to the existing `ray.util.ActorPool`?**
+
+Different API, different purpose. `ray.util.ActorPool` takes a pre-created list of actor handles, returns direct results (calls `ray.get()` internally), and provides iterator methods (`get_next`, `get_next_unordered`, `map_unordered`). It has no retries, no autoscaling, no C++ backing. The new `ray.experimental.ActorPool` takes an actor *class*, manages actor lifecycle itself, returns `ObjectRef`s (caller decides when to `ray.get()`), and delegates selection/retry/backpressure to C++. They coexist — neither replaces the other yet.
+
+**Q: `submit()` returns `ObjectRef`, but what if C++ queues the task (no actor available)?**
+
+If all actors are alive but at capacity, `SelectActorFromPool` falls back to over-submitting to the least-loaded alive actor (`actor_pool_manager.cc:397-402`). The caller always gets a valid `ObjectRef`. If there are *zero* alive actors, C++ queues internally in `PoolWorkQueue` and returns an empty ref list, which makes `submit()` raise `RuntimeError("Failed to submit task to pool: no alive actors with capacity")` (`actor_pool.py:346-349`). This means there's no way to "submit and wait for an actor to become available" — the caller must retry. This is a gap compared to `ray.util.ActorPool` which silently queues in `_pending_submits`.
+
+**Q: `size=4` sets `min_size=0, max_size=-1`. Doesn't that mean the pool can scale down to 0?**
+
+Yes. The `size` parameter only sets `initial_size` — it doesn't constrain autoscaling bounds (`actor_pool.py:137-142`). `scale(-4)` on a `size=4` pool succeeds and leaves 0 actors. Subsequent `submit()` raises. This is intentional for the Data adapter path (where `min_size`/`max_size` are set explicitly), but surprising for standalone users who expect `size=4` to mean "always 4 actors." A standalone user who wants a fixed-size pool should use `ActorPool(actor_cls=W, min_size=4, max_size=4)`.
+
+**Q: No `get_next()` or `get_next_unordered()` — how do users process results incrementally?**
+
+They use standard Ray primitives: `ray.wait(refs, num_returns=1)` for as-completed processing, or `ray.get(refs)` for ordered batch retrieval. The new API returns `ObjectRef`s and stays out of result iteration. This is a deliberate tradeoff — the old `ray.util.ActorPool` hides `ray.get()` behind iteration, which couples pool lifecycle to result consumption. The new API decouples them: submit tasks → hold refs → process results however you want.
+
+**Q: `submit()` takes `method_name` as a string. Why not `pool.submit(actor.method, *args)` like the old API?**
+
+The old API's `submit(fn, value)` takes a lambda `fn(actor, value)` where the caller picks the method. The new API needs to resolve the method signature and function descriptor for C++ submission (`actor_pool.py:322-324`). It uses `self._actor_handles[0]` to look up `_ray_method_signatures[method_name]` and `_ray_function_descriptor[method_name]`. A string name is the simplest way to do that lookup. A `pool.submit(Worker.method, *args)` style would require introspecting the unbound method to extract the descriptor — doable but more complex.
+
+**Q: `submit()` uses `self._actor_handles[0]` to get the function descriptor. What if actors have different methods?**
+
+All actors in a pool are instances of the same `actor_cls`, so their method signatures and descriptors are identical. Using `[0]` is safe — it's just a descriptor lookup, not a submission target (C++ picks the actual actor). The only risk is if `_actor_handles` is empty, which is guarded by the `if not self._actor_handles: raise RuntimeError` check on line 318.
+
+**Q: `map()` is just a loop calling `submit()`. No batching, no backpressure. Won't this flood the pool?**
+
+Yes. `map()` (`actor_pool.py:372-377`) submits all items eagerly and returns all `ObjectRef`s. If you pass 1M items, it creates 1M work items in C++. For large workloads, users should implement their own batching with `ray.wait()` between batches, or use Ray Data (which has `can_add_input()` backpressure). The `map()` method is a convenience for small-to-medium workloads, not a replacement for Ray Data's streaming execution.
+
+**Q: Can users call actor methods directly via `pool.actors[i].method.remote()`, bypassing the pool?**
+
+Yes. The `actors` property (`actor_pool.py:255-257`) returns actor handles, and nothing prevents direct calls. This bypasses C++ selection, retry, load balancing, and in-flight tracking. The pool's `num_tasks_in_flight` won't count these tasks, and backpressure will be wrong. This is a leaky abstraction — useful for debugging or one-off diagnostics, but misuse silently breaks pool semantics. Worth documenting.
+
+**Q: `shutdown()` takes `grace_period_s` but it's unused. What actually happens to in-flight tasks?**
+
+`shutdown()` calls `ray.kill(actor, no_restart=True)` on every actor immediately (`actor_pool.py:442-446`), then unregisters the pool. In-flight tasks on those actors will fail with `ACTOR_DIED`. Since the pool is unregistered, `OnPoolTaskComplete` ignores the completion (`actor_pool_manager.cc:340-344`), so no retry is attempted. The `grace_period_s` parameter is a placeholder (TODO P7). A real drain-before-kill would need to wait for `stats()["total_in_flight"] == 0` before killing.
+
+**Q: `__del__` calls `unregister_actor_pool` but doesn't kill actors. Isn't that a resource leak?**
+
+Yes. If a user drops all references to the pool without calling `shutdown()`, `__del__` (`actor_pool.py:455-466`) unregisters the C++ pool but leaves actors running. Those actors continue consuming cluster resources until the driver exits or they crash. This is a known gap — `__del__` is best-effort cleanup (may not even run if the interpreter is shutting down). The docstring should recommend explicit `shutdown()`, ideally via a context manager (not yet implemented).
+
+**Q: `RetryPolicy.max_attempts` — is that total attempts or retries after the first try?**
+
+Retries after the first try. The C++ field is `max_retry_attempts` (`actor_pool_manager.h:86`), and the check in `OnTaskFailed` is `work_item.attempt_number > config.max_retry_attempts` (`actor_pool_manager.cc:570-571`). `attempt_number` starts at 0 and increments on each failure. So `max_attempts=3` means up to 3 retries (4 total executions). The Python field is named `max_attempts` but maps to `max_retry_attempts` in C++ — this naming asymmetry could confuse users.
+
+**Q: `OrderingMode.PER_KEY_FIFO` and `GLOBAL_FIFO` are in the enum but hit `RAY_LOG(FATAL)` if used. Should they be exposed?**
+
+They're exposed in `__all__` and the enum (`actor_pool.py:40-48`), but `RegisterPool` in C++ calls `RAY_LOG(FATAL)` if either mode is requested (`actor_pool_manager.cc:77-82`). This crashes the driver. The enum values exist for API forward-compatibility (so future phases don't break existing code), but should be documented as not-yet-implemented, or gated with a Python-side validation that raises `NotImplementedError` before reaching C++.
+
+**Q: The `logical_id_label_key`, `logical_id_kwarg_name`, and `static_labels` parameters feel Ray Data-specific. Should they be on the public API?**
+
+They're there because `ClassBasedActorPoolAdapter` needs them to integrate with Ray Data's actor tracking (`core_actor_pool_adapter.py:140-142`). For a standalone user, these are noise — you'd never set them. A cleaner design would move these to the adapter or a subclass, keeping the public `ActorPool` API minimal. For Phase 1 this is acceptable since the API is `experimental`, but worth revisiting before promoting to stable.
+
+**Q: Why isn't `ActorPool` a context manager?**
+
+No `__enter__` / `__exit__` methods are defined. Users must remember to call `shutdown()`. Adding context manager support (`with ActorPool(...) as pool:`) would be straightforward and prevent resource leaks. This is a common Python API pattern for resource-owning objects.
+
 ### Proto & Wire Compatibility
 
 **Q: Adding fields 46-47 to `TaskSpec` — could this break older workers?**
