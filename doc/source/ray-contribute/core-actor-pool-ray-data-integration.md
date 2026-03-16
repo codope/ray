@@ -25,7 +25,7 @@ Ray Data's `ActorPoolMapOperator` manages the pool via an internal Python class 
 - **Creates actors** by calling `ray.remote(MyClass).remote()`
 - **Picks which actor gets each task** using a Python selector (`_ActorTaskSelectorImpl`) that ranks actors by locality and load
 - **Tracks per-actor task counts** for backpressure (`max_tasks_in_flight_per_actor`)
-- **Handles autoscaling** — scales up when utilization exceeds ~80%, scales down when below ~20%
+- **Handles autoscaling** — scales up when utilization exceeds 1.75x (i.e., tasks in flight / (concurrency * actors) >= 1.75), scales down when utilization drops below 0.5x
 
 ### What goes wrong on failure
 
@@ -44,6 +44,7 @@ Instead of Ray Data managing actors individually and picking which one gets each
 ### Python API (`ray.experimental.actor_pool`)
 
 ```python
+import ray
 from ray.experimental.actor_pool import ActorPool, RetryPolicy
 
 @ray.remote
@@ -73,7 +74,7 @@ Under the hood, `ActorPool.__init__` calls `core_worker.register_actor_pool()` t
 
 ### Feature flag
 
-The Core ActorPool is gated behind a feature flag (defined in `python/ray/data/context.py:214`):
+The Core ActorPool is gated behind a feature flag (defined in `python/ray/data/context.py`):
 
 - **Environment variable:** `RAY_DATA_USE_CORE_ACTOR_POOL=1`
 - **Programmatic:** `DataContext.get_current().use_core_actor_pool = True`
@@ -146,7 +147,7 @@ If `ray_remote_args_fn` is set (dynamic per-call actor options), the legacy Pyth
 
 ### Behavioral differences when the flag is on
 
-These matter for anyone debugging or testing:
+These matter for anyone debugging or testing. The table reflects **Phase 1 (current)** behavior:
 
 | Aspect | Legacy | Core Pool |
 |---|---|---|
@@ -154,7 +155,7 @@ These matter for anyone debugging or testing:
 | Lineage reconstruction | Rebuilds on original actor | Can rebuild on any pool actor |
 | Actor selection | Python ranking by (locality, load) | C++ ranking with same criteria |
 | Backpressure tracking | Python per-actor counters | C++ `get_occupied_task_slots()` |
-| Scale-down actor choice | Last-added (LIFO) | Idle actor removal via adapter |
+| Scale-down actor choice | First idle actor found (insertion order) | First idle actor found (insertion order) |
 | Stats | Basic | Adds `total_tasks_retried`, `backlog_size`, `total_in_flight` |
 
 The adapter exposes pool stats via `ActorPool.stats()`, which queries the C++ pool manager and returns a dict with keys like `total_tasks_submitted`, `total_tasks_failed`, `total_tasks_retried`, `num_actors`, `backlog_size`, and `total_in_flight`.
@@ -218,7 +219,6 @@ RAY_DATA_USE_CORE_ACTOR_POOL=1 pytest python/ray/data/tests/test_actor_pool_reco
 
 Be aware of what doesn't work yet, to avoid surprises:
 
-- **Cross-actor retry callbacks not fully wired** — retries currently fall back to same-actor retry. The routing infrastructure is in place; the callback plumbing is Phase 2 work.
 - **`ray_remote_args_fn` forces the legacy path** — dynamic per-call actor options are incompatible with the static-option pool construction model.
 - **No driver recovery or pool persistence** — if the driver dies, pools are lost. Planned for Phase 2.
 - **No multi-submitter support** — only the driver can submit to a pool. Planned for Phase 2.
@@ -232,6 +232,6 @@ Be aware of what doesn't work yet, to avoid surprises:
 | `python/ray/experimental/actor_pool.py` | Public Python API (`ActorPool`, `RetryPolicy`) |
 | `python/ray/data/_internal/execution/operators/core_actor_pool_adapter.py` | Ray Data adapter (`ClassBasedActorPoolAdapter`) |
 | `python/ray/data/_internal/execution/operators/actor_pool_map_operator.py` | Operator with dual-path logic |
-| `python/ray/data/context.py:214,658` | Feature flag definition |
+| `python/ray/data/context.py` | Feature flag definition |
 | `src/ray/core_worker/actor_pool_manager.h` | C++ pool manager interface |
-| `python/ray/_raylet.pyx:4820-5092` | Cython bridge methods |
+| `python/ray/_raylet.pyx` | Cython bridge methods |
