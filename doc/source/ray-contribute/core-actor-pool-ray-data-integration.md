@@ -2,9 +2,7 @@
 
 This document explains how the new C++-backed Core ActorPool integrates with Ray Data. It covers what changes for Ray Data, how to enable it, the migration path, compatibility guarantees, and testing strategy.
 
-For the detailed internals design (pool manager, work queue, retry state machine), see `Core_Actor_Pool_0309.md`.
-
-**Target audience:** Ray Data engineers who understand pipelines, operators, and streaming execution at a high level but may not be familiar with how actor-based execution (`ActorPoolMapOperator`, `_ActorPool`) works under the hood.
+For the detailed internals design (pool manager, work queue, retry state machine), see [this doc](https://docs.google.com/document/d/1B6IztJAYILCp_qxo3UEmKXY_5ApqPT8YW1kcA4mipxQ/edit).
 
 ---
 
