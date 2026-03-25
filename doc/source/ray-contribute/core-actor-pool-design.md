@@ -1,9 +1,8 @@
-# Core Actor Pool Design Review
+# Core Actor Pool Design Notes
 
-**PR**: #61622 (~5.5K lines, 33 files)
+**PR**: [#61622](https://github.com/ray-project/ray/pull/61622)
 **Status**: Draft — design review before code review
-**Meeting format**: 14 sections, ~5 min each (~70 min total)
-
+**Design Doc**: [Core Actor Pool](https://docs.google.com/document/d/1B6IztJAYILCp_qxo3UEmKXY_5ApqPT8YW1kcA4mipxQ/edit?usp=sharing)
 ---
 
 ## 1. Motivation & Goals
@@ -26,7 +25,6 @@ Ray Data's Python actor pool has three fundamental limitations:
 
 ### Non-goals / Deferred
 
-- `PER_KEY_FIFO` / `GLOBAL_FIFO` ordering modes (Phase 2)
 - Core-controlled autoscaling (`SelectActorForRemoval`)
 - Grace period shutdown (drain-before-kill)
 - `ray_remote_args_fn` support in core pool path
@@ -43,7 +41,7 @@ Ray Data's Python actor pool has three fundamental limitations:
 │    └── _try_schedule_tasks_internal() ← legacy path                 │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Python Adapter                                                     │
-│  ClassBasedActorPoolAdapter (AutoscalingActorPool interface)         │
+│  CoreActorPoolAdapter (AutoscalingActorPool interface)              │
 │    ├── submit_task()  → C++ pool selects actor                      │
 │    ├── num_free_task_slots() → C++ GetOccupiedTaskSlots             │
 │    └── num_active_actors()   → C++ GetNumActiveActors               │
@@ -80,8 +78,9 @@ When off, legacy Python pool path is unchanged.
 | C++ | `src/ray/core_worker/core_worker.cc:400-440` | Wiring (constructor, callbacks) |
 | C++ | `src/ray/core_worker/core_worker.cc:838-874` | `InternalHeartbeat` pool task resubmission |
 | C++ | `src/ray/core_worker/core_worker.cc:2847-2887` | `SubmitActorTaskForPool` |
-| C++ | `src/ray/core_worker/task_submission/actor_task_submitter.cc:33-50` | `MaybeNotifyPoolTaskComplete`, `IsPoolTask` |
+| C++ | `src/ray/core_worker/task_submission/actor_task_submitter.cc:29-58` | `MaybeNotifyPoolTaskSubmitted` (in-flight increment at `PushActorTask`), `MaybeNotifyPoolTaskComplete` |
 | C++ | `src/ray/core_worker/task_manager.cc:1064-1078` | Lineage pinning override |
+| C++ | `src/ray/core_worker/task_manager.cc:541-574` | `MovePoolTaskActorDependency` (reference count transfer on redirect) |
 | C++ | `src/ray/core_worker/lease_policy.h:27-39` | `LocalityDataProviderInterface` |
 | Proto | `src/ray/protobuf/common.proto:625-628` | `actor_pool_id` (field 46), `actor_pool_work_item_id` (field 47) |
 | Cython | `python/ray/_raylet.pyx:4825-5064` | Cython bindings (nogil calls) |
@@ -97,11 +96,11 @@ When off, legacy Python pool path is unchanged.
 
 These anticipate "why not just..." questions:
 
-### Why `max_retries=0` at task level?
+### Why `max_retries=-1` at task level?
 
-Ray's built-in retry is actor-bound: `TaskSpec` is bound to a specific `ActorId` at submission time, so retries always go to the SAME actor. Cross-actor retry requires pool-level routing. Pool manages retries; task-level `max_retries=0` avoids double-retry.
+Ray's built-in retry is actor-bound: `TaskSpec` is bound to a specific `ActorId` at submission time, so retries always go to the SAME actor. We use `max_retries=-1` (infinite) to keep the `ObjectRef` alive through actor failures. When an actor dies, `ActorTaskSubmitter` retries the task (keeping the same `ObjectRef` pending), and `InternalHeartbeat` redirects the task to a healthy pool actor. The pool does NOT submit new tasks for retries — it relies on this redirect mechanism to reuse the original `TaskID`/`ObjectRef`.
 
-**Ref**: `core_worker.cc:2850` — `actor_handle->SetActorTaskSpec(builder, ..., /*max_retries=*/0, ...)`
+**Ref**: `core_worker.cc:2863` — `actor_handle->SetActorTaskSpec(builder, ..., /*max_retries=*/-1, ...)`
 
 ### Why a new `ActorPoolManager` vs extending `ActorTaskSubmitter`?
 
@@ -147,7 +146,7 @@ Key methods:
 
 **Ref**: `actor_pool_work_queue.h:89-115`
 
-Interface with `Push`, `Pop`, `HasWork`, `Size`, `Clear`. Only `UnorderedPoolWorkQueue` (FIFO deque) implemented. `PER_KEY_FIFO` and `GLOBAL_FIFO` deferred to Phase 2.
+Interface with `Push`, `Pop`, `HasWork`, `Size`, `Clear`. Only `UnorderedPoolWorkQueue` (FIFO deque) implemented.
 
 ### `LocalityDataProviderInterface` (reused)
 
@@ -157,13 +156,15 @@ Already implemented by `ReferenceCounter`. Provides `GetLocalityData(ObjectID)` 
 
 ### `ActorTaskSubmitterInterface` (extended)
 
-**Ref**: `actor_task_submitter.h:210-211`
+**Ref**: `actor_task_submitter.h:210-222`
 
-Added `SetPoolTaskCompletionCallback()` — wired once during CoreWorker construction. `HandlePushTaskReply()` calls `MaybeNotifyPoolTaskComplete()` on every pool task completion.
+Two callbacks wired once during CoreWorker construction:
+- `SetPoolTaskCompletionCallback()` — `HandlePushTaskReply()` calls `MaybeNotifyPoolTaskComplete()` on every pool task terminal completion.
+- `SetPoolTaskSubmittedCallback()` — `PushActorTask()` calls `MaybeNotifyPoolTaskSubmitted()` when a pool task is actually pushed to an actor's RPC queue. This is the single point for in-flight count increments, covering both original submissions and `InternalHeartbeat` redirects.
 
 ### `AutoscalingActorPool` (reused)
 
-Ray Data's pool interface. `ClassBasedActorPoolAdapter` implements it, delegating to C++ `ActorPool`.
+Ray Data's pool interface. `CoreActorPoolAdapter` implements it, delegating to C++ `ActorPool`.
 
 **Ref**: `core_actor_pool_adapter.py:48`
 
@@ -217,11 +218,15 @@ Transitions:
   RUNNING  ──[actor death detected]──────────→  DEAD
 
 Per-actor counters:
-  num_tasks_in_flight   — incremented on submit, decremented on completion
-  consecutive_failures  — incremented on failure, reset to 0 on success
+  num_tasks_in_flight   — incremented when PushActorTask sends the task to the
+                          actor (via PoolTaskSubmittedCallback), decremented on
+                          completion (via OnPoolTaskComplete), zeroed on actor
+                          death (OnActorDead). This ensures redirected retries
+                          are tracked on the correct actor.
 
 Dead actors are never selected by SelectActorFromPool.
-Tasks in-flight on dead actors get routed to other actors via cross-actor retry.
+Dead actors have num_tasks_in_flight reset to 0 (stale counts cleared).
+Tasks in-flight on dead actors get routed to other actors via InternalHeartbeat redirect.
 ```
 
 ---
@@ -237,7 +242,11 @@ Tasks in-flight on dead actors get routed to other actors via cross-actor retry.
      → SubmitToActor()                             [actor_pool_manager.cc:470]
        → submit_actor_task_fn_ callback
          → CoreWorker::SubmitActorTaskForPool()    [core_worker.cc:2847]
-           Sets max_retries=0, tags pool metadata on TaskSpec
+           Sets max_retries=-1, tags pool metadata on TaskSpec
+         → actor_task_submitter_->SubmitTask()
+           → PushActorTask()                       [actor_task_submitter.cc:659]
+             → MaybeNotifyPoolTaskSubmitted()      ← increments in-flight count
+               → ActorPoolManager::OnTaskSubmitted()
 
 2. Completion detection
    ActorTaskSubmitter::HandlePushTaskReply()        [actor_task_submitter.cc]
@@ -246,7 +255,25 @@ Tasks in-flight on dead actors get routed to other actors via cross-actor retry.
        → pool_task_completion_callback_
          → ActorPoolManager::OnPoolTaskComplete()  [actor_pool_manager.cc:327]
 
-3. Failure handling
+3. Actor death → retry via InternalHeartbeat
+   With max_retries=-1, ActorTaskSubmitter retries the task (will_retry=true).
+   The pool is NOT notified via MaybeNotifyPoolTaskComplete (skipped when will_retry).
+   Instead, OnActorDead() zeros the dead actor's in-flight count.
+
+   CoreWorker::InternalHeartbeat()                 [core_worker.cc:863]
+     → spec.IsPoolTask() check
+     → SelectActorForTask() → picks healthy actor B
+     → MovePoolTaskActorDependency()               [task_manager.cc]
+       (updates reference counts from old to new actor creation dummy)
+     → mutate TaskSpec actor_id to B
+     → actor_task_submitter_->SubmitTask()
+       → PushActorTask()
+         → MaybeNotifyPoolTaskSubmitted()          ← increments B's in-flight
+     → task completes on B
+       → MaybeNotifyPoolTaskComplete()             ← decrements B's in-flight
+
+4. Pool-level retry (for pool's own ShouldRetryTask path — currently secondary
+   to the InternalHeartbeat path since max_retries=-1 handles most retries)
    OnPoolTaskComplete(status=error)
      → OnTaskFailed()                              [actor_pool_manager.cc:522]
        → ShouldRetryTask() (error classification) [actor_pool_manager.cc:687]
@@ -285,9 +312,9 @@ Tasks in-flight on dead actors get routed to other actors via cross-actor retry.
      bool task_retryable = (it->second.num_retries_left_ != 0 || is_pool_task) &&
                            !it->second.reconstructable_return_ids_.empty();
 
-   Pool tasks are ALWAYS eligible for reconstruction, overriding
-   the max_retries=0 check. This is the key insight: max_retries=0
-   at task level, but pool manages retries.
+   Pool tasks are ALWAYS eligible for reconstruction. With max_retries=-1,
+   num_retries_left_ is -1 (infinite), so the standard check already passes.
+   The is_pool_task override is a defensive safeguard.
 
 2. Lineage pinning
    task_manager.cc:1068-1071:
@@ -303,9 +330,14 @@ Tasks in-flight on dead actors get routed to other actors via cross-actor retry.
      → spec.IsPoolTask() check
      → actor_pool_manager_->SelectActorForTask()   [core_worker.cc:858]
        selects healthy actor
+     → task_manager_->MovePoolTaskActorDependency() [task_manager.cc]
+       (moves reference count from old actor's creation dummy object
+        to new actor's — prevents stale dependency from blocking lineage GC)
      → redirect TaskSpec to new actor              [core_worker.cc:868-873]
        (mutates actor_id + creation_dummy_object_id)
-     → resubmit task
+     → resubmit task via actor_task_submitter_->SubmitTask()
+       (PushActorTask fires PoolTaskSubmittedCallback → in-flight tracking
+        is correctly updated for the new actor)
 ```
 
 ### Memory cost of lineage pinning
@@ -345,9 +377,10 @@ can_add_input()                                    [actor_pool_map_operator.py:3
 
 ### Key fixes
 
-- `_release_running_actor` now calls `remove_actor_from_pool` on C++ side (`core_actor_pool_adapter.py:563`)
-- Pool-submitted tasks: C++ tracks in-flight counts authoritatively. No Python-side increment needed (`core_actor_pool_adapter.py:417-418`)
-- Legacy direct-submission tasks: Python-side tracking still used for per-actor state (`core_actor_pool_adapter.py:435-444`)
+- **In-flight tracking at `PushActorTask`**: `PoolTaskSubmittedCallback` fires when a pool task is actually pushed to an actor's RPC queue (not at `SubmitToActor` time). This ensures redirected retries via `InternalHeartbeat` are tracked on the correct actor. `OnActorDead` zeros the dead actor's count.
+- **Per-actor C++ query**: `GetActorTasksInFlight(pool_id, actor_id)` exposed through Cython. The adapter's `_try_remove_idle_actor` queries C++ directly instead of Python-side state, preventing the autoscaler from killing actors that have redirected tasks.
+- **No Python-side per-actor tracking**: The adapter removed `num_tasks_in_flight` from `_ActorState`. `on_task_submitted()` and `on_task_completed()` are no-ops for pool-submitted tasks — C++ is authoritative.
+- `_release_running_actor` calls `remove_actor_from_pool` on C++ side (`core_actor_pool_adapter.py:597`)
 
 ---
 
@@ -397,11 +430,9 @@ DEFAULT_USE_CORE_ACTOR_POOL = env_bool("RAY_DATA_USE_CORE_ACTOR_POOL", False)
 use_core_pool = data_context.use_core_actor_pool and not self._ray_remote_args_fn
 
 if use_core_pool:
-    self._actor_pool = ClassBasedActorPoolAdapter(...)
-    self._actor_task_selector = None   # C++ handles selection
+    self._actor_pool = CoreActorPoolAdapter(...)  # C++ handles selection
 else:
-    self._actor_pool = _ActorPool(...)
-    self._actor_task_selector = self._create_task_selector(...)
+    self._actor_pool = _ActorPool(...)            # Python handles selection
 ```
 
 ### Two submission paths
@@ -416,7 +447,7 @@ _try_schedule_tasks_internal():
     → Python task selector → actor.submit.remote()  # Python selects actor
 ```
 
-### `ClassBasedActorPoolAdapter` bridges interfaces
+### `CoreActorPoolAdapter` bridges interfaces
 
 **Ref**: `core_actor_pool_adapter.py:48-586`
 
@@ -436,8 +467,9 @@ Both paths coexist indefinitely behind the feature flag; rollback = unset env va
 
 | Scenario | Behavior | Risk |
 |----------|----------|------|
-| **Single actor dies** | Tasks retried on different actor with exponential backoff | Low |
+| **Single actor dies** | `OnActorDead` zeros in-flight count; `InternalHeartbeat` redirects task to healthy actor; `PushActorTask` callback updates tracking on new actor | Low |
 | **Node crash kills N actors** | Each failed task retried independently; `SelectActorFromPool` distributes across survivors; exponential backoff prevents thundering herd | Low |
+| **Force downscale during in-flight tasks** | Adapter's `_try_remove_idle_actor` queries C++ `GetActorTasksInFlight(pool_id, actor_id)` — actors with redirected tasks show correct in-flight counts and are not removed | Low (fixed) |
 | **All actors dead** | `SelectActorFromPool` returns Nil → work items queued indefinitely → drained when new actor added via `AddActorToPool` | **Medium** — no timeout/error propagation; tasks wait forever |
 | **Driver crash** | Pool state lost; in-flight tasks continue/fail normally on workers; no cleanup of work items or async timers | **Medium** — async timer captures `this`, potential use-after-free if destruction races with timer |
 | **GCS failover** | No impact — pool metadata is entirely local to CoreWorker, no GCS storage | Low |
@@ -464,14 +496,14 @@ Both paths coexist indefinitely behind the feature flag; rollback = unset env va
 
 | Test Suite | File | Count | Scope |
 |-----------|------|-------|-------|
-| C++ unit tests | `src/ray/core_worker/tests/actor_pool_manager_test.cc` | 32 | Pool lifecycle, selection, locality, backpressure, retry, error classification |
-| Work queue tests | `src/ray/core_worker/tests/actor_pool_work_queue_test.cc` | 7 | FIFO, push/pop, clear, stress |
-| Reconstruction E2E | `src/ray/core_worker/tests/actor_pool_reconstruction_test.cc` | 4 | Node kill, cascading operators |
-| Python API tests | `python/ray/tests/test_actor_pool_v2.py` | 15 | Creation, submission, scaling, stats, shutdown |
-| Python API (basic) | `python/ray/tests/test_actor_pool.py` | 11 | Basic pool operations |
+| C++ unit tests | `src/ray/core_worker/tests/actor_pool_manager_test.cc` | 22 | Pool lifecycle, selection, locality, backpressure, actor death/restart, in-flight tracking |
+| Work queue tests | `src/ray/core_worker/tests/actor_pool_work_queue_test.cc` | 6 | FIFO, push/pop, clear, stress |
+| C++ reconstruction | `src/ray/core_worker/tests/actor_pool_reconstruction_test.cc` | 2 | Actor removal redirect, cascading two-pool reconstruction |
+| Task manager tests | `src/ray/core_worker/tests/task_manager_test.cc` | 4 | Pool task lineage pinning, resubmit, actor dependency move |
+| Python API tests | `python/ray/tests/test_actor_pool_v2.py` | 16 | Creation, submission, scaling, stats, shutdown, cross-actor retry |
 | Parity tests | `python/ray/data/tests/test_actor_pool_map_operator.py` | 3 | Legacy vs core path comparison (map, scaling, stats) |
-| Data integration | `python/ray/data/tests/test_actor_pool_map_operator.py` | 39 total | Full operator lifecycle |
-| Reconstruction (Data) | `python/ray/data/tests/test_actor_pool_reconstruction.py` | 2 | End-to-end with Ray Data |
+| Data integration | `python/ray/data/tests/test_actor_pool_map_operator.py` | 39+ total | Full operator lifecycle |
+| Reconstruction (Data) | `python/ray/data/tests/test_actor_pool_reconstruction.py` | 3 | E2E with Ray Data: single pool, cascading with sort, cascading without sort |
 
 ---
 
@@ -487,18 +519,21 @@ Both paths coexist indefinitely behind the feature flag; rollback = unset env va
 
 | Risk | Location | Impact |
 |------|----------|--------|
-| Work items not cleaned up on `UnregisterPool` | `actor_pool_manager.cc:116-118` (TODO C2) | `TaskArg` objects leak |
-| Async retry timers capture raw `this` pointer | `actor_pool_manager.cc:637-647` | Shutdown ordering matters; potential use-after-free |
+| Work items not cleaned up on `UnregisterPool` | `actor_pool_manager.cc:97-99` (TODO C2) | `TaskArg` objects leak until CoreWorker destruction |
+| Async retry timers capture raw `this` pointer | `actor_pool_manager.cc:658-670` | Safe in practice (`io_service_.stop()` cancels timers before destruction), but relies on shutdown ordering discipline |
 | No observability integration | — | No dashboard, metrics export, or task events for pool-level data |
+| `ActorPool.shutdown()` always force-kills actors | `actor_pool.py:452-456` | `force=False` still calls `ray.kill(no_restart=True)`, preventing lineage reconstruction for in-flight outputs. Should drop references instead (matching legacy `_ActorPool` behavior) |
 
 ### Future work
 
-- Ordering modes (`PER_KEY_FIFO`, `GLOBAL_FIFO`)
 - Core-controlled autoscaling (`SelectActorForRemoval`)
 - `ray_remote_args_fn` support
 - Event-driven actor state (callback from ActorManager instead of polling)
 - Per-pool locking (if contention measured)
 - Microbenchmarks (selection latency, throughput at scale)
+- Streaming generator support in `ActorPool.submit()` (currently only returns `ObjectRef`; the Data adapter handles generators directly via Cython)
+- `ActorPool` as context manager (`__enter__`/`__exit__`)
+- Graceful shutdown with drain-before-kill (`grace_period_s` parameter is currently unused)
 
 ---
 
@@ -508,7 +543,7 @@ Both paths coexist indefinitely behind the feature flag; rollback = unset env va
 
 **Q: Why not use Ray's built-in `max_retries` instead of building pool-level retry?**
 
-Ray's task retry is actor-bound. When you submit a task to actor A with `max_retries=3`, the `TaskSpec` is stamped with actor A's `ActorId` at submission time. All 3 retries go to the *same* actor A. If actor A is dead, all retries fail. Cross-actor retry requires a layer above that can re-route the task to actor B, which is what `ActorPoolManager` does. Setting `max_retries=0` at the task level avoids double-retry (pool retries + Ray retries fighting each other).
+Ray's task retry is actor-bound. When you submit a task to actor A with `max_retries=3`, the `TaskSpec` is stamped with actor A's `ActorId` at submission time. All 3 retries go to the *same* actor A. Cross-actor retry requires a layer that can re-route the task to actor B. We use `max_retries=-1` (infinite) to keep the `ObjectRef` alive through failures, then `InternalHeartbeat` redirects the task to a healthy pool actor. The pool's `ActorPoolManager` provides the cross-actor selection logic (`SelectActorForTask`), while `ActorTaskSubmitter`'s infinite retry mechanism keeps the task alive.
 
 **Q: What happens if a task fails mid-stream with a streaming generator?**
 
@@ -516,7 +551,7 @@ Ray's task retry is actor-bound. When you submit a task to actor A with `max_ret
 
 **Q: Can a retried task land on the same actor that just failed?**
 
-Yes, in theory. `SelectActorFromPool` picks the actor with the best `(locality_rank, load)`. If the failed actor is still alive (e.g., a transient `ACTOR_UNAVAILABLE` error), its `consecutive_failures` counter increments but it remains a candidate. However, since `num_tasks_in_flight` was decremented on failure and other actors likely have lower load, the failed actor is *unlikely* to be re-selected. There is no explicit exclusion list — that's a potential Phase 2 improvement.
+Yes, in theory. `SelectActorFromPool` picks the actor with the best `(locality_rank, load)`. If the failed actor is still alive (e.g., a transient `ACTOR_UNAVAILABLE` error), it remains a candidate. However, `OnActorDead` marks dying actors as `is_alive=false`, so dead actors are excluded from selection. A restarted actor becomes a candidate again via `OnActorAlive`. Since other surviving actors likely have lower load, the failed actor is *unlikely* to be re-selected immediately. There is no explicit exclusion list — that's a potential Phase 2 improvement.
 
 **Q: What if all actors die simultaneously (e.g., node crash)?**
 
@@ -573,13 +608,13 @@ The fallback ensures callers always get valid `ObjectRef`s instead of empty resu
 
 **Q: On the legacy direct-submission path, does `GetOccupiedTaskSlots` still work?**
 
-`ClassBasedActorPoolAdapter` always queries C++ via `GetOccupiedTaskSlots`. For legacy-path tasks (submitted directly to actors, not through C++ pool), the C++ pool doesn't know about them — its `num_tasks_in_flight` counters won't reflect those tasks. However, the adapter is only instantiated when `supports_pool_submission = True`, meaning the legacy path uses the old `_ActorPool` class, not the adapter. So there's no mismatch in practice.
+`CoreActorPoolAdapter` always queries C++ via `GetOccupiedTaskSlots`. For legacy-path tasks (submitted directly to actors, not through C++ pool), the C++ pool doesn't know about them — its `num_tasks_in_flight` counters won't reflect those tasks. However, the adapter is only instantiated when `supports_pool_submission = True`, meaning the legacy path uses the old `_ActorPool` class, not the adapter. So there's no mismatch in practice.
 
 ### Lineage & Memory
 
-**Q: Pool tasks set `max_retries=0` but are still eligible for lineage reconstruction. Isn't that contradictory?**
+**Q: Pool tasks use `max_retries=-1`. How does lineage reconstruction work?**
 
-Intentionally so. `max_retries=0` tells Ray's *task-level* retry mechanism not to retry (since retries would go to the same dead actor). But the lineage pinning check in `task_manager.cc:1064-1066` has an explicit override: `is_pool_task || num_retries_left_ != 0`. This means pool tasks pin their `TaskSpec` for reconstruction even though the task-level retry count is 0. The pool manages retries at a higher level, and lineage reconstruction uses the pool's `SelectActorForTask` to pick a healthy actor during `InternalHeartbeat`.
+With `max_retries=-1`, `num_retries_left_` is `-1` (infinite), so the standard `num_retries_left_ != 0` check already makes pool tasks eligible for lineage reconstruction. The `IsPoolTask()` override in the lineage check (`task_manager.cc:1064-1066`) is a defensive safeguard in case `max_retries` is ever changed to a finite value. During reconstruction, `InternalHeartbeat` detects the pool task, calls `SelectActorForTask` to pick a healthy actor, calls `MovePoolTaskActorDependency` to update reference counts, and resubmits to the new actor.
 
 **Q: For streaming generators, what exactly gets pinned for lineage?**
 
@@ -649,13 +684,9 @@ Yes. If a user drops all references to the pool without calling `shutdown()`, `_
 
 Retries after the first try. The C++ field is `max_retry_attempts` (`actor_pool_manager.h:86`), and the check in `OnTaskFailed` is `work_item.attempt_number > config.max_retry_attempts` (`actor_pool_manager.cc:570-571`). `attempt_number` starts at 0 and increments on each failure. So `max_attempts=3` means up to 3 retries (4 total executions). The Python field is named `max_attempts` but maps to `max_retry_attempts` in C++ — this naming asymmetry could confuse users.
 
-**Q: `OrderingMode.PER_KEY_FIFO` and `GLOBAL_FIFO` are in the enum but hit `RAY_LOG(FATAL)` if used. Should they be exposed?**
-
-They're exposed in `__all__` and the enum (`actor_pool.py:40-48`), but `RegisterPool` in C++ calls `RAY_LOG(FATAL)` if either mode is requested (`actor_pool_manager.cc:77-82`). This crashes the driver. The enum values exist for API forward-compatibility (so future phases don't break existing code), but should be documented as not-yet-implemented, or gated with a Python-side validation that raises `NotImplementedError` before reaching C++.
-
 **Q: The `logical_id_label_key`, `logical_id_kwarg_name`, and `static_labels` parameters feel Ray Data-specific. Should they be on the public API?**
 
-They're there because `ClassBasedActorPoolAdapter` needs them to integrate with Ray Data's actor tracking (`core_actor_pool_adapter.py:140-142`). For a standalone user, these are noise — you'd never set them. A cleaner design would move these to the adapter or a subclass, keeping the public `ActorPool` API minimal. For Phase 1 this is acceptable since the API is `experimental`, but worth revisiting before promoting to stable.
+They're there because `CoreActorPoolAdapter` needs them to integrate with Ray Data's actor tracking (`core_actor_pool_adapter.py:140-142`). For a standalone user, these are noise — you'd never set them. A cleaner design would move these to the adapter or a subclass, keeping the public `ActorPool` API minimal. For Phase 1 this is acceptable since the API is `experimental`, but worth revisiting before promoting to stable.
 
 **Q: Why isn't `ActorPool` a context manager?**
 
@@ -668,5 +699,3 @@ No `__enter__` / `__exit__` methods are defined. Users must remember to call `sh
 No. Both fields are `optional bytes` (protobuf 3 syntax). Older workers that don't know about these fields will: (a) ignore them when deserializing (standard protobuf behavior), (b) pass them through unchanged if forwarding, and (c) never set them, so `IsPoolTask()` returns false on any task they generate. Newer workers handle missing fields gracefully — empty `actor_pool_id` means "not a pool task". This is the standard Ray pattern for extending `TaskSpec`.
 
 ---
-
-*Design document for PR #61622. See also: [Actor Pool RFC](actor-pool-rfc.md)*
