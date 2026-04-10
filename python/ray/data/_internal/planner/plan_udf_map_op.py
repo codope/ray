@@ -308,6 +308,7 @@ def plan_udf_map_op(
             batch_size=op.batch_size,
             batch_format=op.batch_format,
             zero_copy_batch=op.zero_copy_batch,
+            collate_fn=op.collate_fn,
             is_udf=True,
             output_block_size_option=output_block_size_option,
         )

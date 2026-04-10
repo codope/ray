@@ -318,6 +318,7 @@ class BatchMapTransformFn(MapTransformFn):
         batch_size: Optional[int] = None,
         batch_format: Optional[BatchFormat] = None,
         zero_copy_batch: bool = True,
+        collate_fn: Optional[Callable[[DataBatch], Any]] = None,
         output_block_size_option: Optional[OutputBlockSizeOption] = None,
     ):
         super().__init__(
@@ -330,6 +331,7 @@ class BatchMapTransformFn(MapTransformFn):
         self._batch_format = batch_format
         self._zero_copy_batch = zero_copy_batch
         self._ensure_copy = not zero_copy_batch and batch_size is not None
+        self._collate_fn = collate_fn
 
         self._batch_fn = batch_fn
 
@@ -342,6 +344,7 @@ class BatchMapTransformFn(MapTransformFn):
             stats=None,
             batch_size=self._batch_size,
             batch_format=self._batch_format,
+            collate_fn=self._collate_fn,
             ensure_copy=ensure_copy,
         )
 

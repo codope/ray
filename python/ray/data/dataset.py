@@ -497,6 +497,7 @@ class Dataset:
         num_cpus: Optional[float] = None,
         num_gpus: Optional[float] = None,
         memory: Optional[float] = None,
+        collate_fn: Optional[Callable] = None,
         concurrency: Optional[Union[int, Tuple[int, int], Tuple[int, int, int]]] = None,
         udf_modifying_row_count: bool = True,
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
@@ -673,6 +674,14 @@ class Dataset:
                 example, specify `num_gpus=1` to request 1 GPU for each parallel map
                 worker.
             memory: The heap memory in bytes to reserve for each parallel map worker.
+            collate_fn: A function to apply to each formatted batch before passing
+                it to ``fn``. Use this to convert batches to tensors or perform
+                GPU-optimized data preparation. For example,
+                ``DefaultCollateFn(pin_memory=True)`` creates pinned PyTorch
+                tensors, enabling faster host-to-device transfers via
+                ``non_blocking=True``. When a typed collate function is provided
+                (e.g., ``ArrowBatchCollateFn``), ``batch_format`` is auto-detected
+                from the collate function type.
             concurrency: This argument is deprecated. Use ``compute`` argument.
             udf_modifying_row_count: If your UDF produces the same number of output rows
                 as it receives, set this parameter to False. It allows Ray Data to
@@ -746,6 +755,7 @@ class Dataset:
             num_cpus=num_cpus,
             num_gpus=num_gpus,
             memory=memory,
+            collate_fn=collate_fn,
             concurrency=concurrency,
             udf_modifying_row_count=udf_modifying_row_count,
             ray_remote_args_fn=ray_remote_args_fn,
@@ -767,6 +777,7 @@ class Dataset:
         num_cpus: Optional[float],
         num_gpus: Optional[float],
         memory: Optional[float],
+        collate_fn: Optional[Callable] = None,
         concurrency: Optional[Union[int, Tuple[int, int], Tuple[int, int, int]]],
         udf_modifying_row_count: bool,
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]],
@@ -804,6 +815,22 @@ class Dataset:
 
         batch_format = _apply_batch_format(batch_format)
 
+        # Auto-detect batch_format from collate_fn type, matching the pattern
+        # in iter_torch_batches (iterator.py:509-519).
+        if collate_fn is not None:
+            from ray.data.collate_fn import (
+                ArrowBatchCollateFn,
+                NumpyBatchCollateFn,
+                PandasBatchCollateFn,
+            )
+
+            if isinstance(collate_fn, ArrowBatchCollateFn):
+                batch_format = "pyarrow"
+            elif isinstance(collate_fn, NumpyBatchCollateFn):
+                batch_format = "numpy"
+            elif isinstance(collate_fn, PandasBatchCollateFn):
+                batch_format = "pandas"
+
         plan = self._plan.copy()
         map_batches_op = MapBatches(
             self._logical_plan.dag,
@@ -812,6 +839,7 @@ class Dataset:
             can_modify_num_rows=udf_modifying_row_count,
             batch_format=batch_format,
             zero_copy_batch=zero_copy_batch,
+            collate_fn=collate_fn,
             min_rows_per_bundled_input=batch_size,
             fn_args=fn_args,
             fn_kwargs=fn_kwargs,

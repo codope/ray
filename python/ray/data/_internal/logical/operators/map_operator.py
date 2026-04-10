@@ -197,6 +197,7 @@ class MapBatches(AbstractUDFMap):
     fn_kwargs: Optional[Dict[str, Any]] = None
     fn_constructor_args: Optional[Iterable[Any]] = None
     fn_constructor_kwargs: Optional[Dict[str, Any]] = None
+    collate_fn: Optional[Callable] = None
     min_rows_per_bundled_input: Optional[int] = None
     compute: Optional[ComputeStrategy] = None
     ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]] = None
