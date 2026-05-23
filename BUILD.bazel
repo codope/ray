@@ -6,7 +6,7 @@
 # We are in the middle of transitioning to a tree of build files.
 # If you would like to help with the move in your PR, please use `git mv` so that the history of the file is retained.
 
-load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "string_flag")
 load("@com_github_grpc_grpc//bazel:cython_library.bzl", "pyx_library")
 load("@hedron_compile_commands//:refresh_compile_commands.bzl", "refresh_compile_commands")
 load("@rules_cc//cc:defs.bzl", "cc_proto_library")
@@ -51,6 +51,36 @@ config_setting(
     name = "jemalloc",
     constraint_values = ["@platforms//os:linux"],
     flag_values = {":jemalloc_flag": "true"},
+)
+
+# Selects the allocator backend for Plasma's object store. dlmalloc is the
+# default. jemalloc and mimalloc are alternative implementations under
+# evaluation; see plan at .claude/plans/yes-let-s-switch-to-lovely-mochi.md.
+# Independent from the :jemalloc_flag above, which controls the LD_PRELOAD
+# profiling build of jemalloc loaded into raylet/GCS.
+string_flag(
+    name = "plasma_allocator_flag",
+    build_setting_default = "dlmalloc",
+    values = [
+        "dlmalloc",
+        "jemalloc",
+        "mimalloc",
+    ],
+)
+
+config_setting(
+    name = "plasma_allocator_dlmalloc",
+    flag_values = {":plasma_allocator_flag": "dlmalloc"},
+)
+
+config_setting(
+    name = "plasma_allocator_jemalloc",
+    flag_values = {":plasma_allocator_flag": "jemalloc"},
+)
+
+config_setting(
+    name = "plasma_allocator_mimalloc",
+    flag_values = {":plasma_allocator_flag": "mimalloc"},
 )
 
 alias(

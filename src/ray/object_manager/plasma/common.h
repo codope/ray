@@ -103,6 +103,8 @@ struct Allocation {
 
   friend class PlasmaAllocator;
   friend class DummyAllocator;
+  friend class JemallocPlasmaAllocator;
+  friend class MimallocPlasmaAllocator;
   friend struct ObjectLifecycleManagerTest;
   FRIEND_TEST(ObjectStoreTest, PassThroughTest);
   FRIEND_TEST(EvictionPolicyTest, Test);

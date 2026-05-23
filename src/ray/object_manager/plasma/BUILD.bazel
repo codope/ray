@@ -241,6 +241,28 @@ ray_cc_library(
     ],
 )
 
+# Spike (Phase 1.5) — mimalloc-backed IAllocator. Linux + macOS only.
+# Single pre-mmapped backing file registered as a mimalloc arena via
+# `mi_manage_os_memory_ex`; structurally identical to dlmalloc's
+# (one fd, dynamic offsets) shared-memory contract.
+ray_cc_library(
+    name = "plasma_allocator_mimalloc",
+    srcs = ["mimalloc_plasma_allocator.cc"],
+    hdrs = ["mimalloc_plasma_allocator.h"],
+    target_compatible_with = select({
+        "@platforms//os:linux": [],
+        "@platforms//os:macos": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":object_manager_plasma_common",
+        ":plasma_allocator_interface",
+        "//src/ray/util:compat",
+        "//src/ray/util:logging",
+        "@mimalloc//:libmimalloc_plasma",
+    ],
+)
+
 ray_cc_library(
     name = "plasma_allocator",
     srcs = ["plasma_allocator.cc"],
@@ -252,6 +274,30 @@ ray_cc_library(
         "//src/ray/object_manager:object_manager_common",
         "//src/ray/util:logging",
         "@com_google_absl//absl/types:optional",
+    ],
+)
+
+# Spike (Phase 1.4) — jemalloc-backed IAllocator. Linked only when the
+# build flag `--//:plasma_allocator_flag=jemalloc` is set, or directly
+# from spike tests. Linux + macOS only. Depends on the prefixed-symbol
+# (`ray_je_`) static build of jemalloc from bazel/jemalloc.BUILD.
+ray_cc_library(
+    name = "plasma_allocator_jemalloc",
+    srcs = ["jemalloc_plasma_allocator.cc"],
+    hdrs = ["jemalloc_plasma_allocator.h"],
+    target_compatible_with = select({
+        "@platforms//os:linux": [],
+        "@platforms//os:macos": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":object_manager_plasma_common",
+        ":plasma_allocator_interface",
+        "//src/ray/util:compat",
+        "//src/ray/util:logging",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/synchronization",
+        "@jemalloc//:libjemalloc_plasma",
     ],
 )
 

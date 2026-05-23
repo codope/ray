@@ -454,3 +454,11 @@ def ray_deps_setup():
         sha256 = "2db82d1e7119df3e71b7640219b6dfe84789bc0537983c3b7ac4f7189aecfeaa",
         strip_prefix = "jemalloc-5.3.0",
     )
+
+    auto_http_archive(
+        name = "mimalloc",
+        url = "https://github.com/microsoft/mimalloc/archive/refs/tags/v2.2.7.tar.gz",
+        build_file = "@io_ray//bazel:mimalloc.BUILD",
+        sha256 = "8e0ed89907a681276bff2e49e9a048b47ba51254ab60daf6b3c220acac456a95",
+        strip_prefix = "mimalloc-2.2.7",
+    )

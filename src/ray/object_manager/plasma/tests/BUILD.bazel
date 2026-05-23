@@ -58,3 +58,36 @@ ray_cc_test(
         "//src/ray/object_manager/plasma:plasma_object_store",
     ],
 )
+
+# Spike-decision-gate tests (Phase 1.6). Each in its own binary so that
+# the file-static "one allocator per process" constraint doesn't conflict
+# with the existing dlmalloc tests.
+ray_cc_test(
+    name = "jemalloc_plasma_allocator_test",
+    srcs = ["jemalloc_plasma_allocator_test.cc"],
+    tags = ["team:core"],
+    target_compatible_with = select({
+        "@platforms//os:linux": [],
+        "@platforms//os:macos": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        "//src/ray/common:id",
+        "//src/ray/object_manager/plasma:plasma_allocator_jemalloc",
+    ],
+)
+
+ray_cc_test(
+    name = "mimalloc_plasma_allocator_test",
+    srcs = ["mimalloc_plasma_allocator_test.cc"],
+    tags = ["team:core"],
+    target_compatible_with = select({
+        "@platforms//os:linux": [],
+        "@platforms//os:macos": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        "//src/ray/common:id",
+        "//src/ray/object_manager/plasma:plasma_allocator_mimalloc",
+    ],
+)
