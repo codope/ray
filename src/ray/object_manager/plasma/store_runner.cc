@@ -26,6 +26,8 @@
 #include <vector>
 
 #include "ray/common/ray_config.h"
+#include "ray/object_manager/plasma/jemalloc_allocator.h"
+#include "ray/object_manager/plasma/plasma_allocator.h"
 #include "ray/util/thread_utils.h"
 
 namespace plasma {
@@ -106,8 +108,16 @@ void PlasmaStoreRunner::Start(ray::SpillObjectsCallback spill_objects_callback,
   RAY_LOG(DEBUG) << "starting server listening on " << socket_name_;
   {
     absl::MutexLock lock(&store_runner_mutex_);
-    allocator_ = std::make_unique<PlasmaAllocator>(
-        plasma_directory_, fallback_directory_, hugepages_enabled_, system_memory_);
+    // Choose allocator based on configuration
+    if (RayConfig::instance().plasma_use_jemalloc()) {
+      RAY_LOG(INFO) << "Using jemalloc allocator for Plasma store";
+      allocator_ = std::make_unique<JemallocAllocator>(
+          plasma_directory_, fallback_directory_, hugepages_enabled_, system_memory_);
+    } else {
+      RAY_LOG(INFO) << "Using dlmalloc allocator for Plasma store";
+      allocator_ = std::make_unique<PlasmaAllocator>(
+          plasma_directory_, fallback_directory_, hugepages_enabled_, system_memory_);
+    }
 #ifndef _WIN32
     std::vector<std::string> local_spilling_paths;
     if (RayConfig::instance().is_external_storage_type_fs()) {
@@ -161,6 +171,24 @@ bool PlasmaStoreRunner::IsPlasmaObjectSpillable(const ObjectID &object_id) {
 int64_t PlasmaStoreRunner::GetFallbackAllocated() const {
   absl::MutexLock lock(&store_runner_mutex_);
   return allocator_ ? allocator_->FallbackAllocated() : 0;
+}
+
+void PlasmaStoreRunner::RecordAllocatorMetrics() const {
+  absl::MutexLock lock(&store_runner_mutex_);
+  if (!allocator_) {
+    return;
+  }
+
+  // Try to cast to specific allocator types to access enhanced metrics
+  auto *jemalloc_allocator = dynamic_cast<JemallocAllocator *>(allocator_.get());
+  if (jemalloc_allocator) {
+    jemalloc_allocator->RecordMetrics();
+  } else {
+    auto *plasma_allocator = dynamic_cast<PlasmaAllocator *>(allocator_.get());
+    if (plasma_allocator) {
+      plasma_allocator->RecordMetrics();
+    }
+  }
 }
 
 std::unique_ptr<PlasmaStoreRunner> plasma_store_runner;

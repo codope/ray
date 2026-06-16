@@ -58,3 +58,36 @@ ray_cc_test(
         "//src/ray/object_manager/plasma:plasma_object_store",
     ],
 )
+
+ray_cc_test(
+    name = "fragmentation_benchmark",
+    size = "large",
+    srcs = ["fragmentation_benchmark.cc"],
+    defines = select({
+        "//:jemalloc": ["JEMALLOC_AVAILABLE"],
+        "//conditions:default": [],
+    }),
+    linkopts = select({
+        "@platforms//os:linux": [
+            "-Wl,-rpath,$$ORIGIN/../_solib_k8",
+            "-Wl,-rpath,$$ORIGIN/../../_solib_k8",
+            "-Wl,-rpath,$$ORIGIN/../../../../../../_solib_k8",
+            # Also search the external runfiles path where versioned libjemalloc.so.2 resides
+            "-Wl,-rpath,$$ORIGIN/../../../../../external/jemalloc/copy_libjemalloc/libjemalloc/lib",
+            "-Wl,-rpath,$$ORIGIN/../../../../../external/jemalloc/copy_libjemalloc_linux/libjemalloc_linux/lib",
+        ],
+        "//conditions:default": [],
+    }),
+    tags = [
+        "benchmark",
+        "manual",  # Only run manually due to performance impact
+        "team:core",
+    ],
+    deps = [
+        "//src/ray/object_manager/plasma:plasma_allocator",
+        "@com_google_googletest//:gtest_main",
+    ] + select({
+        "//:jemalloc": ["//src/ray/object_manager/plasma:jemalloc_allocator"],
+        "//conditions:default": [],
+    }),
+)

@@ -101,6 +101,7 @@ ray_cc_library(
     copts = PLASMA_COPTS,
     linkopts = PLASMA_LINKOPTS,
     deps = [
+        ":jemalloc_allocator",
         ":obj_lifecycle_mgr",
         ":plasma_allocator",
         ":plasma_object_store",
@@ -250,8 +251,38 @@ ray_cc_library(
         ":plasma_malloc",
         "//src/ray/common:ray_config",
         "//src/ray/object_manager:object_manager_common",
+        "//src/ray/stats:stats_metric",
         "//src/ray/util:logging",
         "@com_google_absl//absl/types:optional",
+    ],
+)
+
+ray_cc_library(
+    name = "jemalloc_allocator",
+    srcs = ["jemalloc_allocator.cc"],
+    hdrs = ["jemalloc_allocator.h"],
+    # Ensure runtime can locate libjemalloc.so from Bazel's solib dir
+    linkopts = select({
+        "@platforms//os:linux": [
+            "-Wl,-rpath,$$ORIGIN/../_solib_k8",
+            "-Wl,-rpath,$$ORIGIN/../../_solib_k8",
+            "-Wl,-rpath,$$ORIGIN/../../../../../../_solib_k8",
+            "-Wl,-rpath,$$ORIGIN/../../../../../external/jemalloc/copy_libjemalloc/libjemalloc/lib",
+            "-Wl,-rpath,$$ORIGIN/../../../../../external/jemalloc/copy_libjemalloc_linux/libjemalloc_linux/lib",
+        ],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":plasma_allocator_interface",
+        ":plasma_malloc",
+        "//src/ray/common:ray_config",
+        "//src/ray/object_manager:object_manager_common",
+        "//src/ray/stats:stats_metric",
+        "//src/ray/util:logging",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:optional",
+        "@jemalloc//:libjemalloc",
     ],
 )
 

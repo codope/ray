@@ -20,7 +20,7 @@
 #include "absl/synchronization/mutex.h"
 #include "ray/asio/instrumented_io_context.h"
 #include "ray/common/file_system_monitor.h"
-#include "ray/object_manager/plasma/plasma_allocator.h"
+#include "ray/object_manager/plasma/allocator.h"
 #include "ray/object_manager/plasma/store.h"
 
 namespace plasma {
@@ -50,6 +50,9 @@ class PlasmaStoreRunner {
 
   int64_t GetFallbackAllocated() const;
 
+  /// Record allocator-specific metrics.
+  void RecordAllocatorMetrics() const;
+
   void GetAvailableMemoryAsync(std::function<void(size_t)> callback) const {
     main_service_.post([this, callback]() { callback(store_->GetAvailableMemory()); },
                        "PlasmaStoreRunner.GetAvailableMemory");
@@ -65,7 +68,7 @@ class PlasmaStoreRunner {
   std::string fallback_directory_;
   mutable instrumented_io_context main_service_{/*enable_lag_probe=*/false,
                                                 /*running_on_single_thread=*/true};
-  std::unique_ptr<PlasmaAllocator> allocator_;
+  std::unique_ptr<IAllocator> allocator_;
   std::unique_ptr<ray::FileSystemMonitor> fs_monitor_;
   std::unique_ptr<PlasmaStore> store_;
 };

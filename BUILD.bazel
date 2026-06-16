@@ -48,8 +48,19 @@ bool_flag(
 )
 
 config_setting(
-    name = "jemalloc",
+    name = "jemalloc_linux",
     constraint_values = ["@platforms//os:linux"],
+    flag_values = {":jemalloc_flag": "true"},
+)
+
+config_setting(
+    name = "jemalloc_macos",
+    constraint_values = ["@platforms//os:macos"],
+    flag_values = {":jemalloc_flag": "true"},
+)
+
+config_setting(
+    name = "jemalloc",
     flag_values = {":jemalloc_flag": "true"},
 )
 

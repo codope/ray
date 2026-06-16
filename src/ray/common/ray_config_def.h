@@ -983,6 +983,10 @@ RAY_CONFIG(int64_t,
 RAY_CONFIG(bool, worker_core_dump_exclude_plasma_store, true)
 RAY_CONFIG(bool, raylet_core_dump_exclude_plasma_store, true)
 
+/// Use jemalloc instead of dlmalloc for Plasma store memory allocation.
+/// jemalloc provides better fragmentation handling for large objects.
+RAY_CONFIG(bool, plasma_use_jemalloc, false)
+
 // Instruct the Python default worker to preload the specified imports.
 // This is specified as a comma-separated list.
 // If left empty, no such attempt will be made.

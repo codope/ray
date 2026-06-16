@@ -102,6 +102,7 @@ struct Allocation {
         fallback_allocated_(false) {}
 
   friend class PlasmaAllocator;
+  friend class JemallocAllocator;
   friend class DummyAllocator;
   friend struct ObjectLifecycleManagerTest;
   FRIEND_TEST(ObjectStoreTest, PassThroughTest);

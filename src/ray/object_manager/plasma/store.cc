@@ -580,6 +580,12 @@ void PlasmaStore::ScheduleRecordMetrics() const {
   absl::MutexLock lock(&mutex_);
   object_lifecycle_mgr_.RecordMetrics();
 
+  // Record allocator-specific metrics for PlasmaAllocator
+  auto *plasma_allocator = dynamic_cast<const PlasmaAllocator *>(&allocator_);
+  if (plasma_allocator) {
+    plasma_allocator->RecordMetrics();
+  }
+
   metric_timer_ = execute_after(
       io_context_,
       [this]() { ScheduleRecordMetrics(); },

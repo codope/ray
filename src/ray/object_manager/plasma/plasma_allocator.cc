@@ -22,6 +22,8 @@
 
 #include "ray/common/ray_config.h"
 #include "ray/object_manager/plasma/malloc.h"
+#include "ray/stats/metric_defs.h"
+#include "ray/stats/tag_defs.h"
 #include "ray/util/logging.h"
 
 namespace plasma {
@@ -91,7 +93,12 @@ std::optional<Allocation> PlasmaAllocator::Allocate(size_t bytes) {
   if (!mem) {
     return absl::nullopt;
   }
+
+  // Update metrics
   allocated_ += bytes;
+  total_alloc_count_++;
+  active_allocations_++;
+
   return BuildAllocation(mem, bytes, /* is_fallback_allocated */ false);
 }
 
@@ -110,7 +117,12 @@ std::optional<Allocation> PlasmaAllocator::FallbackAllocate(size_t bytes) {
     return absl::nullopt;
   }
 
+  // Update metrics
   allocated_ += bytes;
+  total_alloc_count_++;
+  active_allocations_++;
+  fallback_alloc_count_++;
+
   // The allocation was servicable using the initial region, no need to fallback.
   if (internal::IsOutsideInitialAllocation(mem)) {
     is_fallback_allocated = true;
@@ -123,7 +135,12 @@ void PlasmaAllocator::Free(Allocation allocation) {
   RAY_CHECK(allocation.address_ != nullptr) << "Cannot free the nullptr";
   RAY_LOG(DEBUG) << "deallocating " << allocation.size_ << " at " << allocation.address_;
   dlfree(allocation.address_);
+
+  // Update metrics
   allocated_ -= allocation.size_;
+  total_free_count_++;
+  active_allocations_--;
+
   if (internal::IsOutsideInitialAllocation(allocation.address_)) {
     fallback_allocated_ -= allocation.size_;
   }
@@ -156,4 +173,99 @@ std::optional<Allocation> PlasmaAllocator::BuildAllocation(void *addr,
   }
   return absl::nullopt;
 }
+
+PlasmaAllocator::MemoryStats PlasmaAllocator::GetStats() const {
+  MemoryStats stats;
+
+  stats.allocated_bytes = allocated_;
+  stats.footprint_limit = kFootprintLimit;
+  stats.fallback_allocated_bytes = fallback_allocated_.load();
+  stats.total_alloc_count = total_alloc_count_.load();
+  stats.total_free_count = total_free_count_.load();
+  stats.fallback_alloc_count = fallback_alloc_count_.load();
+  stats.active_allocations = active_allocations_.load();
+
+  // Estimate fragmentation as unused space in the footprint limit
+  // This is a rough estimate since dlmalloc doesn't expose detailed fragmentation info
+  int64_t used_space = allocated_ + kDlMallocReserved;
+  if (kFootprintLimit > 0 && used_space > 0) {
+    stats.fragmentation_estimate =
+        1.0 - static_cast<double>(used_space) / static_cast<double>(kFootprintLimit);
+    // Clamp to reasonable bounds
+    if (stats.fragmentation_estimate < 0) stats.fragmentation_estimate = 0.0;
+    if (stats.fragmentation_estimate > 1) stats.fragmentation_estimate = 1.0;
+  } else {
+    stats.fragmentation_estimate = 0.0;
+  }
+
+  return stats;
+}
+
+void PlasmaAllocator::RecordMetrics() const {
+  auto stats = GetStats();
+
+  // Record basic allocator statistics - using dlmalloc prefix for distinction
+  ray::stats::STATS_object_store_memory.Record(
+      stats.allocated_bytes, {{ray::stats::LocationKey, "dlmalloc_allocated"}});
+
+  ray::stats::STATS_object_store_memory.Record(
+      stats.footprint_limit, {{ray::stats::LocationKey, "dlmalloc_footprint_limit"}});
+
+  ray::stats::STATS_object_store_memory.Record(
+      stats.fallback_allocated_bytes,
+      {{ray::stats::LocationKey, "dlmalloc_fallback_allocated"}});
+
+  // Record fragmentation as a percentage (0-100)
+  ray::stats::STATS_object_store_memory.Record(
+      static_cast<int64_t>(stats.fragmentation_estimate * 100),
+      {{ray::stats::LocationKey, "dlmalloc_fragmentation_pct"}});
+
+  // Record operation counts
+  ray::stats::STATS_object_store_memory.Record(
+      stats.total_alloc_count, {{ray::stats::LocationKey, "dlmalloc_total_allocs"}});
+
+  ray::stats::STATS_object_store_memory.Record(
+      stats.total_free_count, {{ray::stats::LocationKey, "dlmalloc_total_frees"}});
+
+  ray::stats::STATS_object_store_memory.Record(
+      stats.fallback_alloc_count,
+      {{ray::stats::LocationKey, "dlmalloc_fallback_allocs"}});
+
+  ray::stats::STATS_object_store_memory.Record(
+      stats.active_allocations,
+      {{ray::stats::LocationKey, "dlmalloc_active_allocations"}});
+}
+
+void PlasmaAllocator::GetDebugDump(std::stringstream &buffer) const {
+  auto stats = GetStats();
+
+  buffer << "\n=== PlasmaAllocator (dlmalloc) Debug Info ===\n";
+  buffer << "- Memory limit: " << stats.footprint_limit << " bytes\n";
+  buffer << "- Alignment: " << kAlignment << " bytes\n";
+  buffer << "- Reserved for dlmalloc: " << kDlMallocReserved << " bytes\n";
+  buffer << "\n";
+
+  buffer << "=== Memory Statistics ===\n";
+  buffer << "- Allocated: " << stats.allocated_bytes << " bytes\n";
+  buffer << "- Fallback allocated: " << stats.fallback_allocated_bytes << " bytes\n";
+  buffer << "- Fragmentation estimate: " << (stats.fragmentation_estimate * 100.0)
+         << "%\n";
+  buffer << "- Available: " << (stats.footprint_limit - stats.allocated_bytes)
+         << " bytes\n";
+  buffer << "\n";
+
+  buffer << "=== Operation Counts ===\n";
+  buffer << "- Total allocations: " << stats.total_alloc_count << "\n";
+  buffer << "- Total frees: " << stats.total_free_count << "\n";
+  buffer << "- Fallback allocations: " << stats.fallback_alloc_count << "\n";
+  buffer << "- Active allocations: " << stats.active_allocations << "\n";
+
+  // Calculate allocation/free balance
+  int64_t balance = stats.total_alloc_count - stats.total_free_count;
+  buffer << "- Allocation balance: " << balance << "\n";
+  if (balance != stats.active_allocations) {
+    buffer << "  WARNING: Balance mismatch with active allocations!\n";
+  }
+}
+
 }  // namespace plasma
